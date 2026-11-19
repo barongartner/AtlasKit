@@ -19,6 +19,13 @@ if ! pgrep -f '^sleep infinity$' >/dev/null; then
     && echo "$(date '+%F %T') start.sh: the WSL keepalive was gone, started it again" >> "$BRIDGE_DIR/bridge.log"
 fi
 
+# The patched bridge runs a one-time Apple device announce unless this marker
+# exists, and a failed announce is retried with a password login on every
+# start. That loop is how an Apple ID gets locked. The kit doesn't use
+# FaceTime (the only reason for the announce), so it's marked done up front.
+# The binary looks for it under $HOME no matter what BRIDGE_DIR says.
+mkdir -p "$HOME/imessage-bridge/state" && touch "$HOME/imessage-bridge/state/announced"
+
 cd "$BRIDGE_DIR/synapse" || exit 1
 pgrep -f synapse.app.homeserver >/dev/null || "$BRIDGE_DIR/synapse-venv/bin/python" -m synapse.app.homeserver -c homeserver.yaml --daemonize
 cd "$BRIDGE_DIR/data" || exit 1

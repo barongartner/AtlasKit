@@ -15,8 +15,8 @@ task, or `update.py --install-task`). Each run:
    them.
 4. Reinstalls the Python packages when requirements.txt changed.
 5. Restarts the crew quietly: watchdogs first (so nobody gets a "went down"
-   text), then the bots, then Start Crew.cmd. Reopens the Atlas app if it was
-   open.
+   text), then the bots, then Start Crew.cmd. The Atlas app is left open; it
+   runs the new code the next time it starts.
 
 Every step goes in Shared\update.log, and the last result in
 Shared\update.json.
@@ -183,32 +183,27 @@ def wait_idle() -> bool:
         time.sleep(10)
 
 
-def stop_crew() -> bool:
-    """Watchdogs first, then the bots. Returns whether the app was open."""
+def stop_crew() -> None:
+    """Watchdogs first, then the bots. The Atlas app is left alone: it may be
+    in the middle of the setup walkthrough, and it picks up new code the next
+    time it opens."""
     dogs = [ROOT / b / f"{b.lower()}_watchdog.pyw" for b in BOTS]
     bots = [ROOT / b / f"{b.lower()}_bot.py" for b in BOTS]
-    app = [ROOT / "App" / "Atlas.pyw"]
     found_dogs = find(dogs)
     kill(pid for pid, _ in found_dogs)
     time.sleep(2)
     found_bots = find(bots)
     kill(pid for pid, _ in found_bots)
-    found_app = find(app)
-    kill(pid for pid, _ in found_app)
-    log(f"stopped {len(found_dogs)} watchdog(s), {len(found_bots)} bot(s)"
-        + (", the Atlas app" if found_app else ""))
+    log(f"stopped {len(found_dogs)} watchdog(s), {len(found_bots)} bot(s)")
     time.sleep(3)
-    return bool(found_app)
 
 
-def start_crew(app_was_open: bool) -> None:
-    flags = DETACHED | NEW_GROUP | NO_WINDOW
-    # A bot with a stop.flag stays down: its watchdog respects the flag.
-    subprocess.Popen(["cmd", "/c", str(SHARED / "Start Crew.cmd")], cwd=str(SHARED), creationflags=flags)
-    if app_was_open:
-        subprocess.Popen([python_exe(windowless=True), str(ROOT / "App" / "Atlas.pyw")],
-                         cwd=str(ROOT / "App"), creationflags=DETACHED | NEW_GROUP)
-    log("crew started again" + (" and the app reopened" if app_was_open else ""))
+def start_crew() -> None:
+    # A bot with a stop.flag stays down: its watchdog respects the flag. With
+    # no config yet (setup not done) the watchdogs exit on their own.
+    subprocess.Popen(["cmd", "/c", str(SHARED / "Start Crew.cmd")], cwd=str(SHARED),
+                     creationflags=DETACHED | NEW_GROUP | NO_WINDOW)
+    log("crew started again")
 
 
 # ----- the update itself -----
@@ -274,7 +269,7 @@ def update(force_restart=False) -> int:
     req_before = (ROOT / "requirements.txt").read_bytes() if (ROOT / "requirements.txt").exists() else b""
     im_before = git("rev-parse", "HEAD:Shared/iMessage", check=False)
 
-    app_was_open = stop_crew()
+    stop_crew()
     try:
         git("reset", "--hard", "--quiet", new)
         for f in set(mine) | set(clash):
@@ -295,7 +290,7 @@ def update(force_restart=False) -> int:
             bridge_note = "the iMessage bridge files changed; open the Atlas app's Setup to rebuild the bridge"
             log(f"NOTE: {bridge_note}")
     finally:
-        start_crew(app_was_open)
+        start_crew()
     save_state(result="updated", version=new[:7], previous=head[:7], updated=datetime.now().isoformat(timespec="seconds"),
                commits=incoming[:20], bridge=bridge_note or None, waiting=None)
     log(f"updated to {new[:7]}")

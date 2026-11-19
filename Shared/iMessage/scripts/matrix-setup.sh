@@ -136,7 +136,10 @@ if st == 200 and key.get("server_name") and key["server_name"] != server:
 
 # ------------------------------------------------------------------- user ----
 st, avail = api("GET", "/_matrix/client/v3/register/available?username=" + q(bot_user))
-if st == 200 and avail.get("available"):
+# With public registration off (it is, on purpose), Synapse answers this check
+# with 403 M_FORBIDDEN instead of yes or no. Then just try the shared-secret
+# registration below; "already taken" there means the user exists.
+if (st == 200 and avail.get("available")) or (st == 403 and avail.get("errcode") == "M_FORBIDDEN"):
     say("STEP", f"Creating the Matrix user {mxid}")
     password = read_secret(pw_file)
     if not password:
@@ -161,9 +164,12 @@ if st == 200 and avail.get("available"):
     st, r = api("POST", "/_synapse/admin/v1/register", {
         "nonce": n["nonce"], "username": bot_user, "password": password,
         "admin": True, "mac": mac.hexdigest()})
-    if st != 200:
+    if st == 400 and r.get("errcode") == "M_USER_IN_USE":
+        say("OK", f"The Matrix user {mxid} already exists")
+    elif st != 200:
         fail(f"Creating {mxid} failed (HTTP {st}, {r.get('errcode', 'no error code')}). Check {hs_dir}/homeserver.log.")
-    say("OK", f"Created the Matrix user {mxid}")
+    else:
+        say("OK", f"Created the Matrix user {mxid}")
 elif st == 400 and avail.get("errcode") == "M_USER_IN_USE":
     say("OK", f"The Matrix user {mxid} already exists")
 elif st == 0:

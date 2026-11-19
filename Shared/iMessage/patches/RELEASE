@@ -1,0 +1,5 @@
+# The prebuilt bridge setup downloads instead of compiling (install.sh download).
+# Built from exactly the commits and patches in this folder.
+version=bridge-2026.11.19
+url=https://github.com/barongartner/AtlasKitDownloads/releases/download/bridge-2026.11.19/matrix-rustpush-linux-x86_64.tar.gz
+sha256=933220a49c3dc82d60579ec0e3afdea59914b4a994dcd9ad85e4558b58e41db0

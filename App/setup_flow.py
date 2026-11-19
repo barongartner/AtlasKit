@@ -93,6 +93,11 @@ def claude_exe() -> str:
     return ""
 
 
+# Emergency numbers people type into the phone box as a joke (North America,
+# UK, EU, Australia, Japan and a few others). They get a joke back.
+EMERGENCY = {"911", "999", "112", "000", "110", "119", "111", "100", "101", "102", "108"}
+
+
 def normalize_phone(raw: str) -> str:
     digits = re.sub(r"\D", "", raw or "")
     if raw.strip().startswith("+") and 8 <= len(digits) <= 15:
@@ -347,7 +352,10 @@ class SetupMixin:
             v = str(v or "").strip()
             if k == "OWNER_PHONE":
                 p = normalize_phone(v)
-                if not p:
+                if re.sub(r"\D", "", v) in EMERGENCY:
+                    errors[k] = ("Atlas texting the cops your morning brief every day is one way to meet them. "
+                                 "Put your own number.")
+                elif not p:
                     errors[k] = "Use the full number, like 403 555 0123 or +44 7700 900123."
                 v = p
             elif k == "OWNER_NAME" and not v:

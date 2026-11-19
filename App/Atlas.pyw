@@ -39,6 +39,7 @@ LOCK = APP / "app.lock"
 SHARED = ROOT / "Shared"
 sys.path.insert(0, str(SHARED))
 import owner  # noqa: E402
+from setup_flow import SetupMixin  # noqa: E402  (the setup walkthrough's backend)
 
 # The Python this app runs on, windowless, for starting bots and watchdogs.
 PYW = Path(sys.executable).with_name("pythonw.exe")
@@ -307,7 +308,7 @@ def pretty(text: str) -> str:
 
 # -------------------------------------------------------------------- api --
 
-class Api:
+class Api(SetupMixin):
     """Everything the page can call. State is underscore-prefixed so
     pywebview doesn't try to expose it."""
 
@@ -325,7 +326,10 @@ class Api:
     # ----- boot / theme -----
 
     def boot(self):
-        return {"crew": CREW, "theme": theme(), "version": "1.0", "owner": OWNER_FOLDER}
+        # The walkthrough opens on first run, after setup was left half done,
+        # or when Setup.cmd starts the app with --setup.
+        setup = "--setup" in sys.argv or not self.setup_done()
+        return {"crew": CREW, "theme": theme(), "version": "1.0", "owner": OWNER_FOLDER, "setup": setup}
 
     def theme(self):
         return theme()

@@ -46,3 +46,9 @@ App/WebView Data/
 
 # My planning notes, never shipped
 PLAN.md
+
+# Setup walkthrough state, dry-run copies, and the CLAUDE.md placeholder copies setup keeps
+Shared/setup.json
+Shared/setup-dryrun.*
+*/CLAUDE.template.md
+App/app.lock

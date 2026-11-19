@@ -27,7 +27,7 @@ sys.path.insert(0, str(HERE))
 import owner  # noqa: E402
 from imessage import BRIDGE_STATE_KEY, decode_ghost, normalize_handle, split_portal_id  # noqa: E402
 
-HS = "http://127.0.0.1:8008"
+HS = (owner.get("MATRIX_URL") or "http://127.0.0.1:8008").rstrip("/")
 KNOWN = HERE.parent / "Iris" / "Memories" / "People" / "Known.json"
 
 

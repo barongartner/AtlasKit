@@ -410,6 +410,7 @@ main {
 .dialog .d-foot { display: flex; gap: 8px; padding: 20px 24px 24px; background: var(--mica); border-top: 1px solid var(--card-stroke); }
 .dialog .d-foot .btn { flex: 1; }
 </style>
+<link rel="stylesheet" href="setup.css">
 </head>
 <body>
 
@@ -424,6 +425,7 @@ main {
     <div class="ns-row"><span class="dot" id="nsCrewDot"></span><span id="nsCrew">Checking the crew...</span></div>
     <div class="ns-row"><span class="dot" id="nsBridgeDot"></span><span id="nsBridge">Checking the bridge...</span></div>
   </div>
+  <button class="nav-item" id="navSetup" onclick="Setup.open()"><i class="ico">&#xE896;</i><span>Setup</span></button>
   <button class="nav-item" data-page="settings"><i class="ico">&#xE713;</i><span>Settings</span></button>
 </nav>
 
@@ -1498,7 +1500,7 @@ $('#setFolder').addEventListener('click', () => call('open_folder', S.bot));
 /* ------------------------------------------------------------------ boot -- */
 document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', e => e.preventDefault());
-$$('.nav-item').forEach(b => b.addEventListener('click', () => show(b.dataset.page)));
+$$('.nav-item[data-page]').forEach(b => b.addEventListener('click', () => show(b.dataset.page)));
 document.addEventListener('keydown', e => {
   if (e.ctrlKey && !e.shiftKey && !e.altKey) {
     const pages = ['overview', 'activity', 'chats', 'memory', 'settings'];
@@ -1539,10 +1541,12 @@ async function start() {
   renderLog();
   snapPoll();
   setInterval(tick, 2000);
+  if (BOOT.setup) Setup.open();
 }
 
 if (window.pywebview && window.pywebview.api && window.pywebview.api.boot) start();
 else window.addEventListener('pywebviewready', start);
 </script>
+<script src="setup.js"></script>
 </body>
 </html>

@@ -1,0 +1,159 @@
+/* Setup walkthrough: a dark, see-through curtain over the Control Center with
+   one window in the middle. Uses the page's own tokens (--accent, --text...)
+   so it follows light/dark and the Windows accent like everything else. */
+
+#suCurtain {
+  position: fixed; inset: 0; z-index: 900; display: flex; align-items: center; justify-content: center;
+  background: rgba(8, 9, 12, 0.62);
+  backdrop-filter: blur(22px) saturate(1.35); -webkit-backdrop-filter: blur(22px) saturate(1.35);
+  opacity: 0; transition: opacity 0.22s ease;
+}
+:root.light #suCurtain { background: rgba(24, 26, 32, 0.46); }
+#suCurtain.on { opacity: 1; }
+#suCurtain.gone { display: none; }
+
+.su-win {
+  width: min(1080px, calc(100vw - 64px)); height: min(740px, calc(100vh - 56px));
+  display: flex; overflow: hidden; border-radius: 10px;
+  background: color-mix(in srgb, var(--mica) 94%, transparent);
+  border: 1px solid rgba(255,255,255,0.09);
+  box-shadow: 0 32px 64px rgba(0,0,0,0.42), 0 2px 21px rgba(0,0,0,0.3);
+  transform: translateY(14px) scale(0.985); transition: transform 0.32s cubic-bezier(0.16, 1, 0.3, 1);
+}
+:root.light .su-win { border-color: rgba(0,0,0,0.08); }
+#suCurtain.on .su-win { transform: none; }
+
+/* ---------------------------------------------------------------- rail -- */
+.su-rail { width: 268px; flex: none; display: flex; flex-direction: column; padding: 20px 10px 12px; }
+.su-brand { display: flex; align-items: center; gap: 12px; padding: 0 12px 14px; }
+.su-mark { width: 34px; height: 34px; border-radius: 9px; flex: none; display: grid; place-items: center;
+  background: linear-gradient(145deg, color-mix(in srgb, var(--accent) 100%, #fff 0%), color-mix(in srgb, var(--accent) 55%, #000));
+  color: var(--on-accent); font: 700 17px/1 "Segoe UI Variable Display", "Segoe UI", sans-serif; box-shadow: inset 0 1px 0 rgba(255,255,255,0.35); }
+.su-brand b { display: block; font: 600 15px/20px "Segoe UI Variable Display", "Segoe UI", sans-serif; }
+.su-brand span { font-size: 12px; color: var(--text-3); }
+.su-steps { flex: 1; overflow: auto; padding: 0 2px; }
+.su-step { position: relative; display: flex; align-items: center; gap: 12px; width: 100%; padding: 4px 12px; margin: 1px 0;
+  border: 0; border-radius: 5px; background: none; text-align: left; color: var(--text-2); }
+.su-step:hover { background: var(--subtle-hover); }
+.su-step.on { background: var(--subtle-hover); color: var(--text); }
+.su-step.on::before { content: ""; position: absolute; left: 0; top: 50%; margin-top: -8px; height: 16px; width: 3px; border-radius: 2px; background: var(--accent); }
+.su-step:disabled { color: var(--text-dis); pointer-events: none; }
+.su-num { width: 22px; height: 22px; border-radius: 50%; flex: none; display: grid; place-items: center; font-size: 11px; font-weight: 600;
+  border: 1px solid var(--ctl-strong); color: var(--text-2); }
+.su-step.on .su-num { border-color: var(--accent); color: var(--accent); }
+.su-step.done .su-num { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-family: var(--icons); font-weight: normal; font-size: 10px; }
+.su-step.skipped .su-num { border-style: dashed; }
+.su-step .t { font-size: 13px; line-height: 17px; }
+.su-step .c { display: block; font-size: 11px; line-height: 14px; color: var(--text-3); }
+.su-railfoot { padding: 10px 12px 0; border-top: 1px solid var(--divider); margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.su-bar { height: 3px; border-radius: 2px; background: var(--ctl-stroke); overflow: hidden; }
+.su-bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; transition: width 0.4s cubic-bezier(0.16,1,0.3,1); }
+.su-dry { align-self: flex-start; font-size: 11px; font-weight: 600; letter-spacing: 0.02em; padding: 2px 8px; border-radius: 10px;
+  background: var(--warn-bg); color: var(--warn); }
+
+/* ----------------------------------------------------------- content -- */
+.su-main { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--content);
+  border-left: 1px solid var(--card-stroke); }
+.su-head { padding: 30px 40px 6px; flex: none; }
+.su-eyebrow { font-size: 12px; font-weight: 600; color: var(--accent); letter-spacing: 0.02em; }
+.su-head h1 { margin: 2px 0 0; font: 600 28px/36px "Segoe UI Variable Display", "Segoe UI", sans-serif; }
+.su-head p { margin: 6px 0 0; color: var(--text-2); max-width: 640px; }
+.su-body { flex: 1; min-height: 0; overflow: auto; padding: 18px 40px 28px; }
+.su-body > * + * { margin-top: 14px; }
+.su-foot { flex: none; display: flex; align-items: center; gap: 8px; padding: 16px 24px 18px 40px;
+  border-top: 1px solid var(--card-stroke); background: var(--mica); }
+.su-foot .msg { font-size: 12px; color: var(--text-3); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.su-foot .btn { min-width: 96px; }
+
+/* page enter */
+.su-anim { animation: suIn 0.34s cubic-bezier(0.16, 1, 0.3, 1); }
+@keyframes suIn { from { opacity: 0; transform: translateX(18px); } to { opacity: 1; transform: none; } }
+
+/* ---------------------------------------------------------- pieces -- */
+.su-card { background: var(--card); border: 1px solid var(--card-stroke); border-radius: 8px; padding: 16px 18px; }
+.su-card h3 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
+.su-card p { margin: 0; color: var(--text-2); }
+.su-card p + p { margin-top: 8px; }
+.su-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+.su-need { display: flex; gap: 12px; align-items: flex-start; }
+.su-need .ico { font-size: 20px; color: var(--accent); margin-top: 2px; }
+.su-need b { display: block; font-weight: 600; }
+.su-need span { color: var(--text-3); font-size: 12px; line-height: 16px; }
+
+.su-checks { border-radius: 8px; border: 1px solid var(--card-stroke); background: var(--card); overflow: hidden; }
+.su-check { display: flex; align-items: center; gap: 14px; padding: 12px 16px; min-height: 52px; }
+.su-check + .su-check { border-top: 1px solid var(--divider); }
+.su-check .st { width: 20px; height: 20px; flex: none; display: grid; place-items: center; border-radius: 50%; font-family: var(--icons); font-size: 10px; }
+.su-check .st.ok { background: var(--ok); color: #000; }
+.su-check .st.bad { background: var(--bad); color: #000; }
+.su-check .st.wait { border: 2px solid color-mix(in srgb, var(--accent) 22%, transparent); border-top-color: var(--accent); animation: spin 0.8s linear infinite; }
+.su-check .st.idle { border: 1px solid var(--ctl-strong); }
+.su-check .tx { flex: 1; min-width: 0; }
+.su-check .tx b { display: block; font-weight: 400; }
+.su-check .tx span { font-size: 12px; color: var(--text-3); }
+.su-check .btn { flex: none; }
+
+.su-info { display: flex; gap: 12px; padding: 12px 16px; border-radius: 6px; border: 1px solid var(--card-stroke);
+  background: color-mix(in srgb, var(--accent) 9%, var(--card-solid)); }
+.su-info .ico { color: var(--accent); margin-top: 2px; }
+.su-info.warn { background: var(--warn-bg); } .su-info.warn .ico { color: var(--warn); }
+.su-info.bad { background: var(--bad-bg); } .su-info.bad .ico { color: var(--bad); }
+.su-info.ok { background: var(--ok-bg); } .su-info.ok .ico { color: var(--ok); }
+.su-info div { flex: 1; color: var(--text); }
+.su-info b { font-weight: 600; }
+
+.su-form { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 18px; max-width: 720px; }
+.su-form .full { grid-column: 1 / -1; }
+.su-field label { display: block; margin-bottom: 6px; }
+.su-field .tb, .su-field select { width: 100%; }
+.su-field select { height: 32px; padding: 0 8px; border-radius: 4px; color: var(--text); background: var(--input);
+  border: 1px solid var(--ctl-stroke); border-bottom-color: var(--ctl-strong); font: inherit; }
+.su-field select option { background: var(--flyout); }
+.su-field .hint { font-size: 12px; color: var(--text-3); margin-top: 4px; line-height: 16px; }
+.su-field .err { font-size: 12px; color: var(--bad); margin-top: 4px; line-height: 16px; }
+.su-field.bad .tb { border-bottom-color: var(--bad); }
+.su-field .opt { color: var(--text-3); font-size: 12px; }
+
+.su-copy { display: flex; align-items: stretch; border-radius: 6px; border: 1px solid var(--card-stroke); background: var(--code); overflow: hidden; }
+.su-copy code { flex: 1; min-width: 0; padding: 10px 12px; font: 12px/18px var(--mono); color: var(--text); white-space: nowrap; overflow: auto; user-select: text; }
+.su-copy .btn { height: auto; border-radius: 0; border: 0; border-left: 1px solid var(--card-stroke); }
+
+.su-steps-list { margin: 0; padding-left: 20px; color: var(--text-2); }
+.su-steps-list li { margin: 4px 0; }
+.su-steps-list b { color: var(--text); font-weight: 600; }
+
+/* console: output of a running job */
+.su-con { border-radius: 8px; border: 1px solid var(--card-stroke); background: #0c0c0c; overflow: hidden; display: flex; flex-direction: column; }
+:root.light .su-con { background: #1b1b1b; }
+.su-con .bar { display: flex; align-items: center; gap: 10px; padding: 8px 10px 8px 14px; background: rgba(255,255,255,0.04);
+  border-bottom: 1px solid rgba(255,255,255,0.06); color: rgba(255,255,255,0.8); font-size: 12px; }
+.su-con .bar .dot { margin-right: 2px; }
+.su-con .bar .btn { height: 26px; min-width: 0; font-size: 12px; color: #fff; background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.08); }
+.su-con pre { margin: 0; padding: 10px 14px; height: 210px; overflow: auto; font: 12px/18px var(--mono); color: rgba(255,255,255,0.78);
+  white-space: pre-wrap; word-break: break-word; user-select: text; }
+.su-con pre .s { color: rgba(255,255,255,0.95); }
+.su-con pre .o { color: #6ccb5f; }
+.su-con pre .w { color: #fce100; }
+.su-con pre .e { color: #ff99a4; }
+.su-con pre .r { color: #60cdff; }
+.su-con .in { display: flex; gap: 8px; padding: 8px 10px; border-top: 1px solid rgba(255,255,255,0.06); }
+.su-con .in .tb { flex: 1; background: rgba(255,255,255,0.06); color: #fff; border-color: rgba(255,255,255,0.08); font-family: var(--mono); font-size: 12px; }
+.su-con .in .btn { color: #fff; background: rgba(255,255,255,0.08); border-color: rgba(255,255,255,0.1); }
+
+.su-stages { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; }
+.su-stage { border-radius: 6px; border: 1px solid var(--card-stroke); background: var(--card); padding: 10px 12px; }
+.su-stage b { display: block; font-size: 13px; font-weight: 600; }
+.su-stage span { font-size: 11px; color: var(--text-3); }
+.su-stage.on { border-color: var(--accent); }
+.su-stage.ok b::after { content: "  \E73E"; font-family: var(--icons); font-size: 10px; color: var(--ok); }
+.su-stage.bad { border-color: var(--bad); }
+
+.su-extra { display: flex; flex-direction: column; gap: 10px; }
+.su-extra .row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+.su-extra .row .su-field { flex: 1; min-width: 200px; }
+.su-done { text-align: center; padding: 40px 0 10px; }
+.su-done .big { width: 72px; height: 72px; border-radius: 50%; margin: 0 auto 18px; display: grid; place-items: center;
+  background: var(--accent); color: var(--on-accent); font-family: var(--icons); font-size: 30px;
+  box-shadow: 0 0 0 10px color-mix(in srgb, var(--accent) 16%, transparent); }
+.su-done h2 { margin: 0; font: 600 22px/28px "Segoe UI Variable Display", "Segoe UI", sans-serif; }
+.su-done p { color: var(--text-2); margin: 8px auto 0; max-width: 460px; }

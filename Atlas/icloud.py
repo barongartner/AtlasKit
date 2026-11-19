@@ -73,11 +73,21 @@ def session() -> PyiCloudService:
     return api
 
 
+def ask_secret(prompt: str) -> str:
+    """getpass in a real console. The setup app runs this with pipes and no
+    console, where getpass can't read the keyboard, so it reads a line from
+    stdin instead (the prompt says "password", so the app hides what's typed)."""
+    if sys.stdin and sys.stdin.isatty():
+        return getpass.getpass(prompt)
+    print(prompt, flush=True)
+    return sys.stdin.readline().strip()
+
+
 def login() -> None:
     # Apple locks the account after a handful of bad passwords, so stop at 4.
     for attempt in range(1, 5):
         try:
-            api = connect(getpass.getpass(f"Apple ID password for {APPLE_ID} (try {attempt} of 4): "))
+            api = connect(ask_secret(f"Apple ID password for {APPLE_ID} (try {attempt} of 4): "))
             break
         except PyiCloudFailedLoginException as e:
             print(f"Wrong: {e}")

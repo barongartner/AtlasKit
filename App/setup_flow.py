@@ -957,6 +957,11 @@ class SetupMixin:
             job.say(f"OK: Atlas's and Iris's files use the name {name}")
             job.say("STEP: Starting Atlas and Iris")
             subprocess.Popen(["cmd", "/c", str(SHARED / "Start Crew.cmd")], creationflags=NO_WINDOW)
+            if (ROOT / ".git").exists():
+                job.say("STEP: Turning on automatic updates")
+                code, out = run([sys.executable, str(SHARED / "update.py"), "--install-task"], timeout=30)
+                job.say("OK: Atlas checks for updates every 30 minutes" if code == 0
+                        else f"WARN: The update task wasn't made: {out.strip()[-200:]}")
             for _ in range(45):  # the watchdogs start the bots; wait for Atlas to hold its lock
                 time.sleep(2)
                 if (ROOT / "Atlas" / "status.json").exists():

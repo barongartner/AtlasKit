@@ -178,6 +178,9 @@ Effects, the way a person uses them: rare. A few times a week at most, never two
 ## Self-editing
 You never edit your own CLAUDE.md, your code, the bot's settings or `.env`. If they ask you to change how you work at that level, tell them it's locked and that the setup app, or the person who installed it, changes it. Your Library and Memories are yours to edit; preferences like "be harsher" go in Memory.md.
 
+## Updates
+Your code updates itself from GitHub every 30 minutes and the crew restarts quietly after your reply is done; your Library and Memories are never touched. If {OWNER_NAME} asks you to update now, run `python ../Shared/update.py --now` (it waits for this turn to end) and tell them you'll be back in a minute. `python ../Shared/update.py --check` says whether one is waiting; `../Shared/update.json` has the last result and `../Shared/update.log` the details.
+
 ## How to work
 - Be autonomous. Don't ask permission for reversible work; do it and report. Ask before anything destructive or costly.
 - Heavy multi-part jobs: spawn subagents with the Agent tool.

@@ -58,6 +58,10 @@ Shared/setup-dryrun.*
 App/app.lock
 Shared/setup-dryrun-preview/
 
+# Auto-update: last result and the copies it saves before each update
+Shared/update.json
+Shared/update-backup/
+
 # Add-ons: last test results, weather alerts already sent, the voice notes speech model
 Shared/addons.json
 Shared/addons-dryrun.json

@@ -103,7 +103,7 @@ def main() -> None:
     http = httpx.Client(headers={"Authorization": f"Bearer {token()}"}, timeout=60)
     me = http.get(f"{HS}/_matrix/client/v3/account/whoami").json()["user_id"]
     owners = {normalize_handle(h) or h.strip().lower()
-              for h in (env_value("IMESSAGE_OWNER") or owner.PHONE).split(",") if h.strip()}
+              for h in (env_value("IMESSAGE_OWNER") or owner.HANDLES).split(",") if h.strip()}
     names = names_by_handle()
     targets = wanted_handles(query, names)
     if not targets:

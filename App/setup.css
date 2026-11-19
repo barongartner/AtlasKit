@@ -102,7 +102,10 @@
 .su-info div { flex: 1; color: var(--text); }
 .su-info b { font-weight: 600; }
 
-.su-form { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 18px; max-width: 720px; }
+.su-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 18px; max-width: 720px; }
+.su-form > * { min-width: 0; }
+@media (max-width: 980px) { .su-form { grid-template-columns: minmax(0, 1fr); } .su-body { padding-left: 28px; padding-right: 28px; } }
+.su-stages { grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)) !important; }
 .su-form .full { grid-column: 1 / -1; }
 .su-field label { display: block; margin-bottom: 6px; }
 .su-field .tb, .su-field select { width: 100%; }
@@ -157,3 +160,78 @@
   box-shadow: 0 0 0 10px color-mix(in srgb, var(--accent) 16%, transparent); }
 .su-done h2 { margin: 0; font: 600 22px/28px "Segoe UI Variable Display", "Segoe UI", sans-serif; }
 .su-done p { color: var(--text-2); margin: 8px auto 0; max-width: 460px; }
+
+/* segmented switch (phone number or email) */
+.su-seg { display: inline-flex; padding: 2px; border-radius: 6px; background: var(--input); border: 1px solid var(--ctl-stroke); gap: 2px; }
+.su-seg button { height: 26px; padding: 0 12px; border: 0; border-radius: 4px; background: transparent; color: var(--text-2); font: inherit; cursor: pointer; }
+.su-seg button:hover { background: var(--subtle-hover); }
+.su-seg button.on { background: var(--seg-on, var(--card-solid)); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,0.25); }
+
+/* city search box */
+.su-combo { position: relative; }
+.su-drop { position: absolute; z-index: 5; left: 0; right: 0; top: calc(100% + 4px); max-height: 260px; overflow: auto; padding: 4px;
+  border-radius: 8px; background: var(--flyout); border: 1px solid var(--card-stroke); box-shadow: var(--shadow, 0 8px 24px rgba(0,0,0,0.35)); }
+.su-opt { display: flex; flex-direction: column; align-items: flex-start; width: 100%; padding: 6px 10px; border: 0; border-radius: 4px;
+  background: transparent; color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.su-opt span { font-size: 12px; color: var(--text-3); }
+.su-opt:hover, .su-opt.on { background: var(--subtle-hover); }
+.su-opt.off { color: var(--text-3); cursor: default; }
+
+/* a sign-in that answers questions with real fields instead of a terminal */
+.su-ask { border-radius: 8px; border: 1px solid var(--card-stroke); background: var(--card); padding: 18px 20px; max-width: 560px; }
+.su-ask .now { display: flex; align-items: center; gap: 10px; color: var(--text-2); }
+.su-ask .now.bad { color: var(--bad); }
+.su-ask .now.ok { color: var(--ok); }
+.su-ask .spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--ctl-stroke); border-top-color: var(--accent); animation: suspin 0.8s linear infinite; flex: none; }
+@keyframes suspin { to { transform: rotate(360deg); } }
+.su-ask .q { margin-top: 14px; }
+.su-ask .q:empty { display: none; }
+.su-ask .q h3 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+.su-ask .q p { margin: 0 0 12px; color: var(--text-2); }
+.su-ask .q .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.su-ask .q .row .tb { flex: 1; min-width: 200px; }
+.su-ask .opts { display: flex; flex-direction: column; gap: 6px; }
+.su-ask .opts .btn { justify-content: flex-start; }
+.su-code { display: flex; gap: 8px; }
+.su-code input { width: 44px; height: 52px; text-align: center; font: 600 22px/1 var(--mono); border-radius: 6px; color: var(--text);
+  background: var(--input); border: 1px solid var(--ctl-stroke); border-bottom: 2px solid var(--ctl-strong); }
+.su-code input:focus { outline: none; border-bottom-color: var(--accent); background: var(--input-focus, var(--input)); }
+.su-code .gap { width: 6px; }
+.su-details { margin-top: 12px; }
+.su-details > button { background: none; border: 0; padding: 0; color: var(--text-3); font: inherit; font-size: 12px; cursor: pointer; text-decoration: underline; }
+.su-details .su-con { margin-top: 8px; }
+.su-pw { position: relative; flex: 1; min-width: 200px; display: flex; }
+.su-pw .tb { flex: 1; padding-right: 36px; }
+.su-pw .eye { position: absolute; right: 2px; top: 2px; bottom: 2px; width: 30px; border: 0; background: transparent; color: var(--text-3);
+  font-family: var(--icons); cursor: pointer; border-radius: 4px; }
+.su-pw .eye:hover { background: var(--subtle-hover); }
+
+/* chips: what do you want Atlas for, news interests */
+.su-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.su-chip { display: inline-flex; align-items: center; gap: 8px; min-height: 32px; padding: 6px 14px; border-radius: 16px; border: 1px solid var(--ctl-stroke);
+  background: var(--ctl); color: var(--text); font: inherit; cursor: pointer; text-align: left; }
+.su-chip:hover { background: var(--ctl-hover); }
+.su-chip.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.su-uses { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; max-width: 760px; }
+.su-use { display: flex; flex-direction: column; gap: 2px; padding: 14px 16px; border-radius: 8px; border: 1px solid var(--card-stroke);
+  background: var(--card); color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.su-use:hover { background: var(--ctl-hover); }
+.su-use b { font-weight: 600; }
+.su-use span { font-size: 12px; color: var(--text-3); }
+.su-use.on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.su-use.on b::after { content: "  \E73E"; font-family: var(--icons); font-size: 11px; color: var(--accent); }
+.su-sub { margin-top: 10px; padding: 12px 14px; border-left: 2px solid var(--accent); background: var(--card); border-radius: 0 6px 6px 0; }
+.su-sub label { display: block; margin-bottom: 6px; }
+.su-beats { display: flex; flex-direction: column; gap: 6px; max-width: 560px; }
+.su-beat { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 6px; background: var(--card); border: 1px solid var(--card-stroke); }
+.su-beat b { flex: 1; font-weight: 600; }
+.su-beat span { color: var(--text-3); font-size: 12px; flex: 2; }
+.su-section { max-width: 760px; }
+.su-section h3 { margin: 18px 0 8px; font-size: 15px; font-weight: 600; }
+.su-section > p { margin: 0 0 10px; color: var(--text-2); }
+.su-list { display: flex; flex-direction: column; gap: 6px; max-width: 560px; }
+.su-list .row { display: flex; gap: 8px; }
+.su-list .row .tb { flex: 1; }
+
+/* 13 steps: only the current one shows its subtitle, so the list fits */
+.su-step:not(.on) .c { display: none; }

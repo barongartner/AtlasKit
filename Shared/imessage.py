@@ -32,7 +32,7 @@ Settings: each key is read from the bot's own .env first, then from
 Shared\\.env (setup writes them there), then falls back to the owner config.
 MATRIX_TOKEN (required to turn iMessage on), MATRIX_URL (default
 http://127.0.0.1:8008), IMESSAGE_OWNER (comma list, e.g. tel:+15551234567;
-default OWNER_PHONE), IMESSAGE_HOME_ROOM (room for messages the bot starts
+default: OWNER_PHONE plus OWNER_IMESSAGE), IMESSAGE_HOME_ROOM (room for messages the bot starts
 itself), IMESSAGE_MGMT_ROOM (the bridge's admin room, for opening new chats),
 IMESSAGE_VIA (this bot's own address, e.g. mailto:bots+atlas@example.com;
 default the +bot alias of BOT_APPLE_ID), IMESSAGE_DEFAULT (1 for Atlas, the
@@ -489,7 +489,7 @@ class IMessage:
         self.mx = Matrix(_setting(env, "MATRIX_URL", "http://127.0.0.1:8008"),
                          _setting(env, "MATRIX_TOKEN"), state_file)
         self.owners = {normalize_handle(h) or h.strip().lower()
-                       for h in _setting(env, "IMESSAGE_OWNER", owner.PHONE).split(",") if h.strip()}
+                       for h in _setting(env, "IMESSAGE_OWNER", owner.HANDLES).split(",") if h.strip()}
         self.via = _setting(env, "IMESSAGE_VIA", _mailto(owner.bot_address(bot_name))).lower()
         self.default = _flag(_setting(env, "IMESSAGE_DEFAULT", "1" if is_atlas else ""))
         self.also = {h.strip().lower() for h in

@@ -28,8 +28,27 @@ def get(name: str, default: str = "") -> str:
 
 
 NAME = get("OWNER_NAME", "the owner")  # first name, used in prompts and texts
-PHONE = get("OWNER_PHONE")  # E.164, e.g. +15551234567; the only number the bots obey
+PHONE = get("OWNER_PHONE")  # E.164, e.g. +15551234567; blank if they text from an email
 EMAIL = get("OWNER_EMAIL")  # their own address (Gmail checks, calendar)
+
+
+def _handle(raw: str) -> str:
+    """A phone number or email in the bridge's spelling: tel:+1555... or mailto:x@y."""
+    r = raw.strip()
+    if not r:
+        return ""
+    if r.lower().startswith(("tel:", "mailto:")):
+        kind, _, rest = r.partition(":")
+        r = rest if kind.lower() == "tel" else r
+    if "@" in r:
+        return "mailto:" + r.split(":", 1)[-1].lower()
+    digits = "".join(c for c in r if c.isdigit())
+    return f"tel:+{digits}" if len(digits) >= 8 else ""
+
+
+# Every iMessage handle the owner texts from: their phone number and/or the
+# Apple ID email(s) in OWNER_IMESSAGE. Only these can give the bots orders.
+HANDLES = ",".join(dict.fromkeys(h for h in map(_handle, [PHONE] + get("OWNER_IMESSAGE").split(",")) if h))
 CITY = get("OWNER_CITY")  # weather and local news
 TZ_NAME = get("OWNER_TIMEZONE", "America/Toronto")  # IANA name
 BOT_APPLE_ID = get("BOT_APPLE_ID")  # the separate Apple ID the bridge signs in with
@@ -51,6 +70,6 @@ def bot_address(bot: str) -> str:
 
 def missing() -> list[str]:
     """The settings setup still has to fill in."""
-    need = {"OWNER_NAME": NAME != "the owner", "OWNER_PHONE": PHONE,
+    need = {"OWNER_NAME": NAME != "the owner", "OWNER_PHONE": HANDLES,
             "OWNER_TIMEZONE": get("OWNER_TIMEZONE"), "BOT_APPLE_ID": BOT_APPLE_ID}
     return [k for k, ok in need.items() if not ok]

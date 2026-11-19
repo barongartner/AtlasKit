@@ -1,6 +1,6 @@
 # Habits
 
-General habit themes Atlas is tracking, built from clusters of saved clips or the owner's own commitments. One theme per idea, not one habit per clip. Check-ins happen in the daily brief; each theme keeps a dated log. Dropped themes move to the bottom.
+General habit themes Atlas is tracking, built from clusters of saved clips or {OWNER_NAME}'s own commitments. One theme per idea, not one habit per clip. Check-ins happen in the daily brief; each theme keeps a dated log. Dropped themes move to the bottom.
 
 Format for each theme:
 

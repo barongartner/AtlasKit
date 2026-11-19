@@ -1,4 +1,4 @@
-"""Fast lane for time-sensitive email: the watch list in Library\\Watches.md.
+"""Fast lane for time-sensitive email: the email watches in watch.py's store.
 
 atlas_bot.py calls check() the moment Gmail pushes new mail (idle_forever), plus a
 safety sweep every WATCH_MINUTES (default 30), day and night.
@@ -7,12 +7,10 @@ often. Unlike email_check.py it does NOT filter bulk senders or non-Primary
 tabs: a watch is an explicit "tell me when THIS lands", so an automated
 mailer@ notice counts.
 
-Watches.md format (one watch per line under "## Active"):
-    - someone@example.com | Reply from Someone
-    - subject:order shipped | Order shipped
-Left of "|" is matched case-insensitively against the From header (name +
-address); prefix "subject:" to match the subject instead. Right of "|" is
-the label shown in the ping. Delete the line to stop watching.
+Watches are added with `python watch.py add email <match>`. The match is
+checked case-insensitively against the From header (name + address), or
+against the subject for a `subject:` watch. Mail sent before the watch was
+set doesn't count. A hit is stamped onto its watch (last fired).
 
 Manual test: python email_watch.py   (prints hits, marks nothing as seen)
 """
@@ -36,8 +34,8 @@ from dotenv import load_dotenv
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE.parent / "Shared"))
 import owner  # noqa: E402
+import watch  # noqa: E402  (the watch store; beside this file)
 
-WATCH_FILE = BASE / "Library" / "Watches.md"
 SEEN_FILE = BASE / "watch_seen.json"
 LOOKBACK_DAYS = 2  # IMAP window; seen-set stops repeats inside it
 FIRST_RUN_GRACE = timedelta(hours=3)  # first-ever run: don't dump old mail
@@ -61,28 +59,24 @@ def gmail_creds() -> tuple[str, str]:
 
 
 def load_watches() -> list[tuple[str, str, str]]:
-    """[(field, needle, label)] from the Active section of Watches.md."""
+    """[(field, needle, label)] for every active email watch (the app's
+    Email page tags matching mail with these)."""
+    return [(r["field"], r["needle"], r["label"]) for r in watch.email_rows()]
+
+
+def _set_before(sent_header: str, created) -> bool:
+    """True when the mail was sent more than 10 minutes before the watch
+    existed: "tell me when X replies" means from now on."""
+    made = watch._parse_dt(created)
+    if not made:
+        return False
     try:
-        lines = WATCH_FILE.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
-    watches, active = [], False
-    for line in lines:
-        if line.startswith("## "):
-            active = line[3:].strip().lower().startswith("active")
-            continue
-        if not active or not line.lstrip().startswith("- "):
-            continue
-        body = line.lstrip()[2:].strip()
-        needle, _, label = body.partition("|")
-        needle, label = needle.strip().strip("`"), label.strip()
-        if not needle:
-            continue
-        field = "from"
-        if needle.lower().startswith("subject:"):
-            field, needle = "subject", needle[8:].strip()
-        watches.append((field, needle.lower(), label or needle))
-    return watches
+        sent = email.utils.parsedate_to_datetime(sent_header or "")
+    except (TypeError, ValueError):
+        return False
+    if not sent:
+        return False
+    return sent.astimezone() < made.astimezone() - timedelta(minutes=10)
 
 
 def _html_text(raw: str) -> str:
@@ -171,10 +165,12 @@ def check(dry_run: bool = False) -> tuple[list[dict], str]:
     isn't set up, or a short message on connection failure."""
     load_dotenv(BASE / ".env", override=True)
     address, password = gmail_creds()
-    watches = load_watches()
+    watches = watch.email_rows()
     if not watches:
         return [], ""
     if not address or not password:
+        if not dry_run:
+            watch.note_email_sweep("Gmail isn't set up (no app password)")
         return [], "nocreds"
 
     first_run = not SEEN_FILE.exists()
@@ -201,13 +197,15 @@ def check(dry_run: bool = False) -> tuple[list[dict], str]:
             if key in seen:
                 continue
             sender, subject = decode(h.get("From", "")), decode(h.get("Subject", ""))
-            label = next(
-                (lbl for field, needle, lbl in watches
-                 if needle in (sender if field == "from" else subject).lower()),
+            row = next(
+                (r for r in watches
+                 if r["needle"] in (sender if r["field"] == "from" else subject).lower()
+                 and not _set_before(h.get("Date", ""), r["created"])),
                 None,
             )
-            if label is None:
+            if row is None:
                 continue
+            label = row["label"]
             if not dry_run:
                 seen.add(key)
             if first_run:
@@ -222,18 +220,32 @@ def check(dry_run: bool = False) -> tuple[list[dict], str]:
             if status == "OK" and full and full[0] is not None:
                 # Long and line-broken: Atlas reads it to pick out the details.
                 snippet = _snippet(email.message_from_bytes(full[0][1]), 4000, "\n")
-            hits.append({"label": label, "from": sender,
+            hits.append({"id": row["id"], "label": label, "from": sender,
                          "subject": subject or "(no subject)", "snippet": snippet})
         imap.logout()
     except (imaplib.IMAP4.error, OSError) as e:
-        return [], f"{type(e).__name__}: {e}"[:200]
+        err = f"{type(e).__name__}: {e}"[:200]
+        if not dry_run:
+            _stamp(lambda: watch.note_email_sweep(err))
+        return [], err
 
     if not dry_run:
         try:
             SEEN_FILE.write_text(json.dumps(sorted(seen)[-2000:]), encoding="utf-8")
         except OSError:
             pass
+        _stamp(lambda: watch.note_email_sweep(""))
+        for hit in hits:
+            _stamp(lambda: watch.mark_fired(hit["id"], f"From {hit['from']}: {hit['subject']}"))
     return hits, ""
+
+
+def _stamp(fn) -> None:
+    """Bookkeeping on the watch store must never cost a hit."""
+    try:
+        fn()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def format_hit(hit: dict) -> str:
@@ -261,7 +273,7 @@ def format_group(label: str, hits: list[dict]) -> str:
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
-    print(f"Watches: {load_watches()}")
+    print(f"Email watches: {[(r['id'], r['field'], r['needle']) for r in watch.email_rows()]}")
     found, err = check(dry_run=True)
     if err:
         print("ERROR:", err)

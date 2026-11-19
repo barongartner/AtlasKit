@@ -93,7 +93,7 @@ HEARTBEAT_MINUTES = _int_env("HEARTBEAT_MINUTES", 60)  # 0 disables
 HEARTBEAT_MODEL = setting("HEARTBEAT_MODEL", "sonnet")  # cheap beats
 QUIET_HOURS = setting("QUIET_HOURS", "23:00-08:00")
 BUS_POLL_SECONDS = 60
-WATCH_MINUTES = _int_env("WATCH_MINUTES", 5)  # Library\Watches.md sweep; 0 disables
+WATCH_MINUTES = _int_env("WATCH_MINUTES", 5)  # unused here: watches are Atlas's (Atlas\watch.py)
 
 SESSION_FILE = BASE / "session_id.txt"
 # Memory.md is loaded every session; Archive.md collects every finished
@@ -114,10 +114,10 @@ def imessage_env() -> dict:
     env = dict(os.environ)
     for key in ("MATRIX_URL", "MATRIX_TOKEN", "IMESSAGE_MGMT_ROOM", "IMESSAGE_ANSWER_OTHERS"):
         env[key] = setting(key)
-    handles = [owner.PHONE] + owner.get("OWNER_IMESSAGE").split(",")
+    handles = owner.HANDLES.split(",")
     env["IMESSAGE_OWNER"] = ",".join(dict.fromkeys(h for h in map(normalize_handle, handles) if h))
     if not env["IMESSAGE_OWNER"]:
-        log.error("OWNER_PHONE isn't set in Shared\\.env: nobody is treated as the owner")
+        log.error("Neither OWNER_PHONE nor OWNER_IMESSAGE is set in Shared\\.env: nobody is treated as the owner")
     # Iris's own address (bot Apple ID +iris). Never the default bot, never
     # Atlas's extra addresses.
     via = owner.bot_address("iris")

@@ -40,6 +40,8 @@ SHARED = ROOT / "Shared"
 sys.path.insert(0, str(SHARED))
 import owner  # noqa: E402
 from setup_flow import SetupMixin  # noqa: E402  (the setup walkthrough's backend)
+from watches_api import WatchesMixin  # noqa: E402  (the Watches page)
+from addons_api import AddonsMixin  # noqa: E402  (the Add-ons page)
 
 # The Python this app runs on, windowless, for starting bots and watchdogs.
 PYW = Path(sys.executable).with_name("pythonw.exe")
@@ -308,7 +310,7 @@ def pretty(text: str) -> str:
 
 # -------------------------------------------------------------------- api --
 
-class Api(SetupMixin):
+class Api(SetupMixin, WatchesMixin, AddonsMixin):
     """Everything the page can call. State is underscore-prefixed so
     pywebview doesn't try to expose it."""
 
@@ -750,7 +752,7 @@ class Api(SetupMixin):
         if not env.get("MATRIX_TOKEN"):
             return {"ok": False, "events": []}
         owners = {im.normalize_handle(h) or h.strip().lower()
-                  for h in (env.get("IMESSAGE_OWNER") or owner.PHONE).split(",") if h.strip()}
+                  for h in (env.get("IMESSAGE_OWNER") or owner.HANDLES).split(",") if h.strip()}
         if not self._me:
             self._me = self._mx_get(env, "/account/whoami").get("user_id", "")
         known = read_json(PEOPLE / "Known.json")

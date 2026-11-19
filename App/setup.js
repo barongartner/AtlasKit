@@ -24,14 +24,16 @@
   const STEPS = [
     { id: 'welcome', t: 'Welcome', c: 'What you need', render: welcome, ready: () => true },
     { id: 'pc', t: 'This PC', c: 'Quick checks', render: pc, ready: () => S.ok.pc },
-    { id: 'you', t: 'About you', c: 'Name, number, time zone', render: you, ready: () => S.ok.you },
+    { id: 'you', t: 'About you', c: 'Name, number, city', render: you, ready: () => S.ok.you },
+    { id: 'uses', t: 'Your Atlas', c: 'What you want it for', render: uses, ready: () => S.ok.uses },
+    { id: 'tailor', t: 'Make it yours', c: 'Brief, news, goals', render: tailor, ready: () => true },
     { id: 'claude', t: 'Claude', c: 'The brain', render: claude, ready: () => S.ok.claude },
     { id: 'wsl', t: 'Linux', c: 'Where the bridge runs', render: wsl, ready: () => S.ok.wsl },
-    { id: 'bridge', t: 'iMessage bridge', c: 'Build it', render: bridge, ready: () => S.ok.bridge },
+    { id: 'bridge', t: 'iMessage bridge', c: 'Get it ready', render: bridge, ready: () => S.ok.bridge },
     { id: 'mac', t: 'Mac identity', c: 'From your MacBook', render: mac, ready: () => S.ok.mac },
     { id: 'apple', t: 'Bot Apple ID', c: 'Sign in once', render: apple, ready: () => S.ok.apple },
     { id: 'connect', t: 'Connect', c: 'Bots meet the bridge', render: connect, ready: () => S.ok.connect },
-    { id: 'extras', t: 'Extras', c: 'Calendar, email, more', render: extras, ready: () => true, optional: true },
+    { id: 'extras', t: 'Add-ons', c: 'Calendar, email, music, more', render: extras, ready: () => true, optional: true },
     { id: 'finish', t: 'Finish', c: 'Say hi', render: finish, ready: () => S.ok.finish },
   ];
 
@@ -92,6 +94,8 @@
       b.onclick = () => go(n);
       box.appendChild(b);
     });
+    const cur = box.querySelector('.su-step.on');
+    if (cur) cur.scrollIntoView({ block: 'nearest' });
     const done = STEPS.filter(s => ['done', 'skipped'].includes((steps[s.id] || {}).status)).length;
     S.root.querySelector('.su-bar i').style.width = `${Math.round(done / STEPS.length * 100)}%`;
     S.root.querySelector('.su-prog').textContent = `Step ${S.i + 1} of ${STEPS.length}`;
@@ -140,6 +144,7 @@
   }
 
   function header(head, eyebrow, title, text) {
+    if (/^Step \d+$/.test(eyebrow)) eyebrow = `Step ${S.i + 1}`;  // steps get added; number them by position
     head.innerHTML = `<div class="su-eyebrow">${E(eyebrow)}</div><h1>${E(title)}</h1>${text ? `<p>${text}</p>` : ''}`;
   }
 
@@ -169,23 +174,32 @@
       ${opts.options ? `<select>${opts.options.map(o => `<option ${o === v ? 'selected' : ''}>${E(o)}</option>`).join('')}</select>`
         : `<input class="tb" ${opts.secret ? 'type="password"' : ''} spellcheck="false" placeholder="${E(set ? 'Saved. Type to replace it.' : (opts.ph || ''))}" value="${E(opts.secret ? '' : v)}">`}
       ${opts.hint ? `<div class="hint">${opts.hint}</div>` : ''}<div class="err hidden"></div></div>`);
+    clearOnEdit(f);
     return f;
   }
 
-  async function saveFields(box, required = []) {
+  // An error under a field goes away as soon as the field is changed.
+  function clearOnEdit(f) {
+    const clear = () => { f.classList.remove('bad'); const e = f.querySelector('.err'); if (e) e.classList.add('hidden'); };
+    f.addEventListener('input', clear);
+    f.addEventListener('change', clear);
+  }
+
+  async function saveFields(box, required = [], extra = {}) {
     const vals = {};
     box.querySelectorAll('.su-field').forEach(f => {
       const inp = f.querySelector('input,select,textarea');
-      if (!inp || !f.dataset.key) return;   // a label-only block, like the alias list
+      if (!inp || !f.dataset.key || inp.disabled) return;   // a label-only block, or a field that's switched off
       const k = f.dataset.key, v = inp.value.trim();
       const secret = inp.type === 'password';
       if (secret && !v) return;          // blank secret = keep what's saved
       vals[k] = v;
-      f.classList.remove('bad'); f.querySelector('.err').classList.add('hidden');
+      f.classList.remove('bad'); const e = f.querySelector('.err'); if (e) e.classList.add('hidden');
     });
-    for (const k of required) if (!vals[k] && !(S.st.secretsSet || {})[k] && !(S.st.env || {})[k]) {
+    Object.assign(vals, extra);
+    for (const k of required) if (!vals[k] && !(S.st.secretsSet || {})[k] && !((S.st.env || {})[k] && !(k in vals))) {
       const f = box.querySelector(`[data-key="${k}"]`);
-      f.classList.add('bad'); const e = f.querySelector('.err'); e.textContent = 'This one is needed.'; e.classList.remove('hidden');
+      f.classList.add('bad'); const e = f.querySelector('.err'); e.textContent = f.dataset.need || 'This one is needed.'; e.classList.remove('hidden');
       return false;
     }
     const r = await api('setup_save', vals);
@@ -230,6 +244,7 @@
     const pre = box.querySelector('pre'), dot = box.querySelector('.dot'), stop = box.querySelector('.stop');
     let job = null, pos = 0, askKind = '';
     const paint = text => {
+      if (opts.onText) opts.onText(text);
       text.split(/(\n)/).forEach(part => {
         if (part === '\n') { pre.appendChild(document.createTextNode('\n')); return; }
         if (!part) return;
@@ -270,9 +285,12 @@
     box.run = (action, params) => new Promise(async resolve => {
       pre.textContent = ''; pos = 0;
       dot.className = 'dot busy';
-      box.classList.remove('hidden');
-      setTimeout(() => box.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
-      const r = await api('setup_run', action, params || {});
+      if (!opts.keepHidden) {
+        box.classList.remove('hidden');
+        setTimeout(() => box.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 50);
+      }
+      // A job someone else already started (the add-ons page) is followed, not started.
+      const r = action && action.follow ? { job: action.follow } : await api('setup_run', action, params || {});
       if (!r || r.error || !r.job) {
         dot.className = 'dot bad';
         paint(`ERROR: ${(r && r.error) || 'It did not start.'}\n`);
@@ -303,7 +321,140 @@
       }, 400);
       S.polls.add(t);
     });
+    // Answer the running job's question from code (askBox does this).
+    box.send = async (v, secret) => {
+      if (!job) return false;
+      paint(`> ${secret ? '********' : v}\n`);
+      await api('setup_input', job, v);
+      return true;
+    };
     return box;
+  }
+
+  /* A job that asks questions (the Apple sign-in, the iCloud sign-in) shown as
+     a real form: what it's doing now, the question as proper fields (password
+     box, six boxes for a code, buttons for a choice), and the raw log behind
+     "Show details". `answers` fills questions in without asking: a value or a
+     function per ASK kind (apple_id, password, code, choice, text). */
+  function askBox(title, opts = {}) {
+    const box = el(`<div class="su-ask hidden"><div class="now"><span class="spin"></span><span class="tx">Starting...</span></div>
+      <div class="q"></div><div class="su-details"><button type="button">Show details</button></div></div>`);
+    box.addEventListener('click', e => e.stopPropagation());
+    const now = box.querySelector('.now'), q = box.querySelector('.q'), det = box.querySelector('.su-details');
+    let buf = '', options = [], lastError = '', running = false;
+    const con = consoleBox(title, {
+      keepHidden: true,
+      onText: text => {
+        buf += text;
+        const lines = buf.split('\n'); buf = lines.pop();
+        lines.forEach(line);
+      }
+    });
+    con.classList.add('hidden');
+    det.appendChild(con);
+    det.querySelector('button').onclick = () => {
+      const show = con.classList.toggle('hidden');
+      det.querySelector('button').textContent = show ? 'Show details' : 'Hide details';
+    };
+    const status = (text, kind) => {
+      now.className = 'now ' + (kind || '');
+      now.innerHTML = kind ? '' : '<span class="spin"></span>';
+      now.appendChild(el(`<span class="tx">${E(text)}</span>`));
+    };
+    const plain = s => s.replace(/^\(dry run\)\s*/, '');
+    const send = async (v, secret) => { q.innerHTML = ''; status(secret ? 'Checking...' : 'Sending...'); await con.send(v, secret); };
+    const ask = (kind, text) => {
+      const auto = opts.answers && opts.answers[kind];
+      const v = typeof auto === 'function' ? auto() : auto;
+      if (v) { send(v, kind === 'password'); return; }
+      q.innerHTML = '';
+      status('Waiting for you');
+      if (kind === 'code') {
+        q.appendChild(el(`<div><h3>Enter the code</h3><p>${E(opts.codeHint || 'Apple just sent a 6-digit code to your iPhone or the trusted phone number. Type it here.')}</p></div>`));
+        const row = el('<div class="su-code"></div>');
+        const boxes = [];
+        for (let n = 0; n < 6; n++) {
+          if (n === 3) row.appendChild(el('<span class="gap"></span>'));
+          const b = el('<input inputmode="numeric" maxlength="1" autocomplete="one-time-code">');
+          boxes.push(b); row.appendChild(b);
+        }
+        const value = () => boxes.map(b => b.value).join('');
+        const done = () => { if (/^\d{6}$/.test(value())) send(value(), false); };
+        boxes.forEach((b, n) => {
+          b.addEventListener('input', () => {
+            const d = b.value.replace(/\D/g, '');
+            if (d.length > 1) {   // a pasted code
+              d.slice(0, 6 - n).split('').forEach((c, k) => { boxes[n + k].value = c; });
+              boxes[Math.min(n + d.length, 5)].focus();
+            } else {
+              b.value = d;
+              if (d && n < 5) boxes[n + 1].focus();
+            }
+            done();
+          });
+          b.addEventListener('keydown', e => { if (e.key === 'Backspace' && !b.value && n > 0) { boxes[n - 1].focus(); boxes[n - 1].value = ''; } });
+        });
+        q.appendChild(row);
+        setTimeout(() => boxes[0].focus(), 30);
+        return;
+      }
+      if (kind === 'choice') {
+        q.appendChild(el(`<div><h3>${E(text.replace(/\s*\(answer with the number\)\s*$/, ''))}</h3></div>`));
+        const list = el('<div class="opts"></div>');
+        options.forEach(o => {
+          const m = o.match(/^(\d+)\)\s*(.*)$/);
+          const b = el(`<button class="btn">${E(m ? m[2] : o)}</button>`);
+          b.onclick = () => send(m ? m[1] : o, false);
+          list.appendChild(b);
+        });
+        options = [];
+        q.appendChild(list);
+        return;
+      }
+      const secret = kind === 'password';
+      q.appendChild(el(`<div><h3>${E(text)}</h3></div>`));
+      const row = el(`<div class="row">${secret ? '<span class="su-pw"><input class="tb" type="password" spellcheck="false"><button type="button" class="eye" title="Show"></button></span>' : '<input class="tb" spellcheck="false">'}<button class="btn accent">Continue</button></div>`);
+      const inp = row.querySelector('input');
+      const go = () => { if (inp.value.trim()) { const v = inp.value; inp.value = ''; send(v, secret); } };
+      row.querySelector('.btn.accent').onclick = go;
+      inp.onkeydown = e => { if (e.key === 'Enter') go(); };
+      const eye = row.querySelector('.eye');
+      if (eye) { eye.textContent = ''; eye.onclick = () => { inp.type = inp.type === 'password' ? 'text' : 'password'; }; }
+      q.appendChild(row);
+      setTimeout(() => inp.focus(), 30);
+    };
+    const line = raw => {
+      const s = raw.trim();
+      if (!s || s.startsWith('> ')) return;
+      let m;
+      if ((m = s.match(/^ASK_OPTION:\s*(.*)$/))) options.push(m[1]);
+      else if ((m = s.match(/^ASK:\s*(\w+)\s*(.*)$/))) ask(m[1], m[2]);
+      else if ((m = s.match(/^STEP:\s*(.*)$/))) status(plain(m[1]));
+      else if ((m = s.match(/^ERROR:\s*(.*)$/))) { lastError = plain(m[1]); status(lastError, 'bad'); }
+      else if ((m = s.match(/^WARN:\s*(.*)$/)) && running) status(plain(m[1]));
+    };
+    box.follow = jobId => box.run({ follow: jobId });
+    box.run = async (action, params) => {
+      box.classList.remove('hidden');
+      q.innerHTML = ''; options = []; lastError = ''; buf = ''; running = true;
+      status('Starting...');
+      const p = await con.run(action, params);
+      running = false;
+      q.innerHTML = '';
+      if (p.code === 0) status(opts.doneText || 'Done.', 'ok');
+      else status(friendly(lastError || p.error || 'It stopped without saying why. Show details has the log.'), 'bad');
+      return p;
+    };
+    return box;
+  }
+
+  // Apple's errors in plain words. Anything not listed is shown as it came.
+  function friendly(err) {
+    const e = String(err || '');
+    if (/-20101|incorrect|wrong password|invalid credentials/i.test(e)) return 'Wrong Apple ID or password. Check them, then try again in 15 minutes.';
+    if (/503|throttl|too many|-22405|-22421|rate/i.test(e)) return 'Apple is making this account wait after too many tries. Leave it for a few hours before trying again.';
+    if (/-21669|verification code|code.*(wrong|incorrect|invalid)/i.test(e)) return 'That code didn’t work. Wait 15 minutes, then sign in again to get a new one.';
+    return e;
   }
 
   /* ------------------------------------------------------- 1 welcome -- */
@@ -336,7 +487,7 @@
       slot.appendChild(checks(list));
       S.ok.pc = S.st.dry || (list.length && list.filter(c => c.id !== 'sleep').every(c => c.ok));
       if (list.some(c => c.id === 'disk' && !c.ok))
-        slot.appendChild(info('bad', 'The bridge build needs about 25 GB. Empty the Recycle Bin, uninstall games or apps you don’t use, or move big folders to another drive, then press Check again.'));
+        slot.appendChild(info('bad', `Setup needs about ${S.st.bridgeRelease ? 8 : 25} GB. Empty the Recycle Bin, uninstall games or apps you don’t use, or move big folders to another drive, then press Check again.`));
       if (list.some(c => c.id === 'virt' && !c.ok))
         slot.appendChild(info('bad', 'Virtualization is off. Restart the PC into the BIOS (usually Delete or F2 at startup), turn on <b>Intel VT-x</b> or <b>AMD SVM</b>, save, and open Atlas again.'));
       if (list.some(c => c.id === 'sleep' && !c.ok))
@@ -352,24 +503,328 @@
   /* ----------------------------------------------------------- 3 you -- */
   function you(head, body) {
     header(head, 'Step 3', 'About you', 'The bots use this to know who you are. Only your number can give them orders.');
-    const tzGuess = (S.st.env || {}).OWNER_TIMEZONE || S.st.windowsTzIana || 'America/Toronto';
+    const env = S.st.env || {};
+    const tzGuess = env.OWNER_TIMEZONE || S.st.windowsTzIana || 'America/Toronto';
     const form = el('<div class="su-form"></div>');
     form.appendChild(field('OWNER_NAME', 'First name', { ph: 'Sam' }));
-    form.appendChild(field('OWNER_PHONE', 'Your iPhone number', { ph: '403 555 0123', hint: 'The number you text from. Anyone else who texts the bots gets treated as a stranger.' }));
-    form.appendChild(field('OWNER_EMAIL', 'Your email', { ph: 'you@gmail.com', optional: true }));
-    form.appendChild(field('OWNER_CITY', 'City', { ph: 'Toronto', hint: 'For the weather and local news in your morning brief.' }));
-    form.appendChild(field('OWNER_TIMEZONE', 'Time zone', { options: TZ.includes(tzGuess) ? TZ : [tzGuess, ...TZ], value: tzGuess,
-      hint: S.st.windowsTz ? `Windows says ${E(S.st.windowsTz)}. Make sure this PC's clock is set to your time zone too.` : '' }));
+
+    // How they text: a phone number, or the Apple ID email Messages sends from
+    // (an iPad, an iPod, a phone with no plan).
+    const how = el(`<div class="su-field" data-how><label>You text from</label>
+      <div class="su-seg"><button type="button" data-m="phone">A phone number</button><button type="button" data-m="email">An email</button></div>
+      <div class="hint">No phone number on your iPhone or iPad? Pick email and use the Apple ID email that Messages sends from.</div></div>`);
+    const phone = field('OWNER_PHONE', 'Your phone number', { ph: '403 555 0123', hint: 'The number you text from. Anyone else who texts the bots gets treated as a stranger.' });
+    const mail = field('OWNER_IMESSAGE', 'The email you iMessage from', { ph: 'you@icloud.com', value: (env.OWNER_IMESSAGE || '').split(',')[0],
+      hint: 'On the iPhone or iPad: Settings, then Apps, then Messages, then Send and Receive. Use the email ticked under "You can be reached by iMessage at". Anyone else who texts the bots gets treated as a stranger.' });
+    mail.dataset.need = 'Put the email you text from.';
+    let mode = env.OWNER_IMESSAGE && !env.OWNER_PHONE ? 'email' : 'phone';
+    const setMode = m => {
+      mode = m;
+      how.querySelectorAll('[data-m]').forEach(b => b.classList.toggle('on', b.dataset.m === m));
+      phone.classList.toggle('hidden', m !== 'phone'); phone.querySelector('input').disabled = m !== 'phone';
+      mail.classList.toggle('hidden', m !== 'email'); mail.querySelector('input').disabled = m !== 'email';
+    };
+    how.querySelectorAll('[data-m]').forEach(b => b.onclick = () => setMode(b.dataset.m));
+    form.append(how, phone, mail);
+    setMode(mode);
+
+    form.appendChild(field('OWNER_EMAIL', 'Your email', { ph: 'you@gmail.com', optional: true, hint: 'For your calendar and email, if you connect them later.' }));
+    const tz = field('OWNER_TIMEZONE', 'Time zone', { options: TZ.includes(tzGuess) ? TZ : [tzGuess, ...TZ], value: tzGuess,
+      hint: S.st.windowsTz ? `Windows says ${E(S.st.windowsTz)}. Make sure this PC's clock is set to your time zone too.` : '' });
+    let tzTouched = !!env.OWNER_TIMEZONE;
+    tz.querySelector('select').addEventListener('change', () => { tzTouched = true; });
+    form.appendChild(cityPicker(c => {
+      if (tzTouched || !c.timezone) return;
+      const sel = tz.querySelector('select');
+      if (![...sel.options].some(o => o.value === c.timezone)) sel.insertBefore(new Option(c.timezone, c.timezone), sel.firstChild);
+      sel.value = c.timezone;
+    }));
+    form.appendChild(tz);
     body.appendChild(form);
-    S.ok.you = !!((S.st.env || {}).OWNER_NAME && (S.st.env || {}).OWNER_PHONE);
     STEPS[2].beforeNext = async () => {
-      const ok = await saveFields(form, ['OWNER_NAME', 'OWNER_PHONE', 'OWNER_TIMEZONE']);
+      const city = form.querySelector('[data-key="OWNER_CITY"]');
+      if (!city.dataset.picked) {
+        city.classList.add('bad'); const e = city.querySelector('.err');
+        e.textContent = city.querySelector('input').value.trim() ? 'Pick your city from the list as you type.' : 'This one is needed.';
+        e.classList.remove('hidden');
+        return false;
+      }
+      const ok = mode === 'phone'
+        ? await saveFields(form, ['OWNER_NAME', 'OWNER_PHONE', 'OWNER_TIMEZONE'], { OWNER_IMESSAGE: '' })
+        : await saveFields(form, ['OWNER_NAME', 'OWNER_IMESSAGE', 'OWNER_TIMEZONE'], { OWNER_PHONE: '' });
       S.ok.you = ok;
       if (ok) msg('Saved.');
       return ok;
     };
     S.ok.you = true; // Continue saves and checks the form
     refresh();
+  }
+
+  /* City: type a few letters, pick from the list. Picking also gives the
+     weather real coordinates and suggests the time zone. */
+  function cityPicker(onPick) {
+    const env = S.st.env || {};
+    const f = el(`<div class="su-field su-city" data-key="OWNER_CITY"><label>City</label>
+      <div class="su-combo"><input class="tb" spellcheck="false" autocomplete="off" placeholder="Start typing your city"><div class="su-drop hidden"></div></div>
+      <div class="hint">For the weather and local news in your morning brief.</div><div class="err hidden"></div>
+      <div class="su-field hidden" data-key="OWNER_LAT"><input><div class="err"></div></div>
+      <div class="su-field hidden" data-key="OWNER_LON"><input><div class="err"></div></div></div>`);
+    const inp = f.querySelector('.su-combo input'), drop = f.querySelector('.su-drop');
+    const lat = f.querySelector('[data-key="OWNER_LAT"] input'), lon = f.querySelector('[data-key="OWNER_LON"] input');
+    inp.value = env.OWNER_CITY || '';
+    lat.value = env.OWNER_LAT || ''; lon.value = env.OWNER_LON || '';
+    if (env.OWNER_CITY) f.dataset.picked = '1';
+    clearOnEdit(f);
+    let timer = 0, seq = 0, items = [], hi = -1;
+    const shut = () => { drop.classList.add('hidden'); hi = -1; };
+    const pick = c => {
+      inp.value = c.label; lat.value = c.lat ?? ''; lon.value = c.lon ?? '';
+      f.dataset.picked = '1'; shut(); onPick && onPick(c);
+    };
+    const paint = () => {
+      drop.innerHTML = '';
+      if (!items.length) { shut(); return; }
+      items.forEach((c, n) => {
+        if (c.error) { drop.appendChild(el(`<div class="su-opt off">${E(c.error)}</div>`)); return; }
+        const o = el(`<button type="button" class="su-opt ${n === hi ? 'on' : ''}"><b>${E(c.name)}</b><span>${E([c.region, c.country].filter(Boolean).join(', '))}</span></button>`);
+        o.onmousedown = e => { e.preventDefault(); pick(c); };
+        drop.appendChild(o);
+      });
+      drop.classList.remove('hidden');
+    };
+    inp.addEventListener('input', () => {
+      delete f.dataset.picked; lat.value = lon.value = '';
+      clearTimeout(timer);
+      const q = inp.value.trim(), me = ++seq;
+      if (q.length < 2) { items = []; paint(); return; }
+      timer = setTimeout(async () => {
+        const r = await api('setup_city_search', q);
+        if (me !== seq) return;
+        items = (r || []).length ? r : [{ error: 'No city by that name. Try the spelling, or a bigger city nearby.' }];
+        hi = items[0] && !items[0].error ? 0 : -1;
+        paint();
+      }, 250);
+    });
+    inp.addEventListener('keydown', e => {
+      const real = items.filter(c => !c.error);
+      if (drop.classList.contains('hidden') || !real.length) return;
+      if (e.key === 'ArrowDown') { hi = Math.min(hi + 1, real.length - 1); paint(); e.preventDefault(); }
+      else if (e.key === 'ArrowUp') { hi = Math.max(hi - 1, 0); paint(); e.preventDefault(); }
+      else if (e.key === 'Enter' && hi >= 0) { pick(real[hi]); e.preventDefault(); }
+      else if (e.key === 'Escape') shut();
+    });
+    inp.addEventListener('blur', () => setTimeout(shut, 120));
+    return f;
+  }
+
+  /* ------------------------------------------------------ your atlas -- */
+  const USES = [
+    ['brief', 'A daily brief', 'Weather, your day and the news you care about, every morning.'],
+    ['track', 'Keeping me on track', 'Reminders, deadlines, and following up until it’s actually done.'],
+    ['goals', 'Goals and habits', 'Check-ins on what you’re working toward and the habits you’re building.'],
+    ['schedule', 'My schedule', 'Your calendar, plans, and “am I free Thursday”.'],
+    ['email', 'Email', 'A heads-up on the emails that matter, and help writing replies.'],
+    ['remember', 'Remembering stuff', 'Send it links, notes and ideas. Ask for them later.'],
+    ['iris', 'Texting people for me', 'Iris texts and emails the people you know, for you.'],
+  ];
+  const picked = () => ((S.st.env || {}).OWNER_WANTS || '').split(',').filter(Boolean);
+
+  function uses(head, body) {
+    header(head, 'Step 4', 'What do you want Atlas for?',
+      'Pick everything that fits. It decides what Atlas does on its own and which questions come next. You can change it later.');
+    const on = new Set(picked());
+    const grid = el('<div class="su-uses"></div>');
+    USES.forEach(([id, t, c]) => {
+      const b = el(`<button type="button" class="su-use ${on.has(id) ? 'on' : ''}"><b>${E(t)}</b><span>${E(c)}</span></button>`);
+      b.onclick = () => {
+        on.has(id) ? on.delete(id) : on.add(id);
+        b.classList.toggle('on', on.has(id));
+        S.ok.uses = on.size > 0; msg(''); refresh();
+      };
+      grid.appendChild(b);
+    });
+    body.appendChild(grid);
+    S.ok.uses = on.size > 0;
+    STEPS[S.i].beforeNext = async () => {
+      if (!on.size) { msg('Pick at least one.', true); return false; }
+      const order = USES.map(u => u[0]).filter(id => on.has(id));
+      const r = await api('setup_save', { OWNER_WANTS: order.join(',') });
+      if (!r || !r.ok) { msg('Couldn’t save that.', true); return false; }
+      S.st = await api('setup_state');
+      return true;
+    };
+  }
+
+  /* ---------------------------------------------------- make it yours -- */
+  const INTERESTS = [
+    ['sports', 'Sports', 'teams'], ['tech', 'Tech'], ['ai', 'AI'], ['gaming', 'Gaming', 'Which games?'],
+    ['music', 'Music', 'Which artists or genres?'], ['tv', 'Movies and TV', 'Which shows or movies?'],
+    ['markets', 'Business and markets', 'Any stocks you follow?'], ['crypto', 'Crypto', 'Which coins?'],
+    ['science', 'Science and space'], ['cars', 'Cars'], ['politics', 'Politics'], ['fashion', 'Fashion'],
+    ['food', 'Food'], ['fitness', 'Health and fitness'],
+  ];
+  const BEAT_TEXT = {
+    tech: 'the biggest real tech story: major launches, phones and apps they use. Not a niche paper or a funding round.',
+    ai: 'new AI models and tools, and what changed this week that they could actually use.',
+    gaming: 'big releases, updates and gaming news', music: 'new releases, tours and music news',
+    tv: 'new releases, trailers and what everyone is watching', markets: 'the market move that matters today and why',
+    crypto: 'the crypto move that matters today and why', science: 'the biggest science or space story',
+    cars: 'the biggest car story: launches, reviews, the industry', politics: 'the political story that actually affects them',
+    fashion: 'the fashion story people will be talking about', food: 'food news, openings and trends worth knowing',
+    fitness: 'health and fitness news backed by real research, not fads',
+  };
+  // The leagues the Watches page can follow (Atlas/watch.py); the brief can cover any team.
+  const LEAGUES = ['NHL', 'NBA', 'WNBA', 'NFL', 'CFL', 'MLB', 'MLS', 'Premier League', 'La Liga', 'Bundesliga', 'Serie A', 'Ligue 1', 'Champions League', 'Formula 1'];
+  const TIMES = [['random 09:00-10:00', 'Sometime between 9 and 10am']].concat(
+    Array.from({ length: 13 }, (_, k) => { const m = 360 + k * 30, h = Math.floor(m / 60), mm = m % 60;
+      return [`${String(h).padStart(2, '0')}:${String(mm).padStart(2, '0')}`, `${h > 12 ? h - 12 : h}:${String(mm).padStart(2, '0')}${h >= 12 ? 'pm' : 'am'}`]; }));
+
+  function tailor(head, body) {
+    const wants = new Set(picked());
+    const saved = (S.st.tailor || {}).ui || {};
+    header(head, 'Step 5', 'Make it yours', 'A few questions so Atlas knows you from the first day instead of the third week. Everything here can change later by just texting Atlas.');
+    const ui = { time: saved.time || 'random 09:00-10:00', beats: saved.beats || { local: true, country: true, world: true },
+      interests: saved.interests || {}, teams: saved.teams || [], extra: saved.extra || '', goals: saved.goals || [], habits: saved.habits || [] };
+    let any = false;
+
+    if (wants.has('brief')) {
+      any = true;
+      const sec = el(`<div class="su-section"><h3>Your morning brief</h3><p>When should it come?</p></div>`);
+      const sel = el(`<select class="tb" style="max-width:280px">${TIMES.map(([v, t]) => `<option value="${v}" ${v === ui.time ? 'selected' : ''}>${E(t)}</option>`).join('')}</select>`);
+      sel.onchange = () => { ui.time = sel.value; };
+      sec.appendChild(el('<div class="su-field"></div>')).appendChild(sel);
+      sec.appendChild(el('<h3>The news in it</h3>'));
+      sec.appendChild(el('<p>The usual three, then whatever you’re into. Tap to turn things on or off.</p>'));
+      const city = ((S.st.env || {}).OWNER_CITY || 'your city').split(',')[0];
+      const base = el('<div class="su-chips"></div>');
+      [['local', `Local (${city})`], ['country', 'Your country'], ['world', 'World']].forEach(([id, t]) => {
+        const c = el(`<button type="button" class="su-chip ${ui.beats[id] ? 'on' : ''}">${E(t)}</button>`);
+        c.onclick = () => { ui.beats[id] = !ui.beats[id]; c.classList.toggle('on', ui.beats[id]); };
+        base.appendChild(c);
+      });
+      sec.appendChild(base);
+      sec.appendChild(el('<p style="margin-top:14px">What are you into?</p>'));
+      const chips = el('<div class="su-chips"></div>'), subs = el('<div></div>');
+      const paintSubs = () => {
+        subs.innerHTML = '';
+        INTERESTS.forEach(([id, t, ask]) => {
+          if (!ui.interests[id] || !ask) return;
+          if (ask === 'teams') { subs.appendChild(teamRows(ui)); return; }
+          const s = el(`<div class="su-sub"><label>${E(t)}: ${E(ask)} <span class="opt">optional</span></label><input class="tb" spellcheck="false" style="width:100%"></div>`);
+          const inp = s.querySelector('input');
+          inp.value = typeof ui.interests[id] === 'string' ? ui.interests[id] : '';
+          inp.oninput = () => { ui.interests[id] = inp.value || true; };
+          subs.appendChild(s);
+        });
+      };
+      INTERESTS.forEach(([id, t]) => {
+        const c = el(`<button type="button" class="su-chip ${ui.interests[id] ? 'on' : ''}">${E(t)}</button>`);
+        c.onclick = () => { if (ui.interests[id]) delete ui.interests[id]; else ui.interests[id] = true; c.classList.toggle('on', !!ui.interests[id]); paintSubs(); };
+        chips.appendChild(c);
+      });
+      sec.append(chips, subs);
+      paintSubs();
+      const extra = el('<div class="su-field" style="margin-top:14px;max-width:560px"><label>Anything else? <span class="opt">optional</span></label><input class="tb" spellcheck="false" placeholder="Formula 1 only, no NASCAR. Local concerts."></div>');
+      extra.querySelector('input').value = ui.extra;
+      extra.querySelector('input').oninput = e => { ui.extra = e.target.value; };
+      sec.appendChild(extra);
+      body.appendChild(sec);
+    }
+
+    if (wants.has('goals')) {
+      any = true;
+      const sec = el(`<div class="su-section"><h3>What are you working toward?</h3><p>Big or small, in your own words. Atlas checks in on these and calls it out when one stalls.</p></div>`);
+      sec.appendChild(listRows(ui.goals, 'Save $2,000 by summer', 5));
+      sec.appendChild(el('<h3>Habits you want to build</h3>'));
+      sec.appendChild(el('<p>Atlas asks about one in the brief each day and keeps a streak.</p>'));
+      sec.appendChild(listRows(ui.habits, 'Gym 4 days a week', 5));
+      body.appendChild(sec);
+    }
+
+    const later = [wants.has('schedule') && 'your calendar', wants.has('email') && 'your email'].filter(Boolean);
+    if (later.length) body.appendChild(info('', `You’ll connect ${later.join(' and ')} near the end, in Add-ons. It’s quick.`));
+    if (!any) body.appendChild(info('ok', 'Nothing else to set up for what you picked. Press Continue.'));
+
+    STEPS[S.i].beforeNext = async () => {
+      if (!any) return true;
+      const city = (S.st.env || {}).OWNER_CITY || 'their city';
+      const beats = [];
+      if (ui.beats.local) beats.push({ label: 'Local', text: `${city}: roads, weather events, council decisions, transit, crime and safety that made the news, big events.` });
+      if (ui.beats.country) beats.push({ label: 'Country', text: 'the one or two national stories everyone will be talking about today, plus anything that changes what things cost.' });
+      if (ui.beats.world) beats.push({ label: 'World', text: 'the biggest international story of the day.' });
+      const teams = ui.teams.filter(t => (t.team || '').trim());
+      INTERESTS.forEach(([id, t]) => {
+        const v = ui.interests[id];
+        if (!v) return;
+        const detail = typeof v === 'string' ? v.trim() : '';
+        let text = BEAT_TEXT[id] || `the biggest ${t.toLowerCase()} story`;
+        if (id === 'sports') text = teams.length ? `${teams.map(x => `${x.team} (${x.league})`).join(', ')}: last night’s result, trades, injuries and anything big. Plus the biggest sports story of the day.` : 'the biggest sports story of the day.';
+        else if (detail) text += `, especially: ${detail}`;
+        beats.push({ label: t, text: text.replace(/\.?$/, '.') });
+      });
+      if (ui.extra.trim()) beats.push({ label: 'Their extra asks', text: ui.extra.trim() });
+      const data = {
+        brief_time: wants.has('brief') ? ui.time : 'off',
+        beats: wants.has('brief') ? beats : [],
+        goals: ui.goals.filter(g => g.trim()),
+        habits: ui.habits.filter(h => h.trim()).map(h => ({ name: h, gist: h })),
+        teams: teams.map(x => ({ league: x.league, team: x.team.trim() })),
+        ui,
+      };
+      const r = await api('setup_tailor', data);
+      if (!r || !r.ok) { msg((r && r.message) || 'Couldn’t save that.', true); return false; }
+      if (r.warn) { window.toast ? toast(r.warn) : msg(r.warn, true); }
+      S.st = await api('setup_state');
+      return true;
+    };
+  }
+
+  // Editable list of short text rows (goals, habits).
+  function listRows(arr, ph, max) {
+    const box = el('<div class="su-list"></div>');
+    const paint = () => {
+      box.innerHTML = '';
+      const rows = arr.length ? arr : [''];
+      if (!arr.length) arr.push('');
+      rows.forEach((v, n) => {
+        const r = el(`<div class="row"><input class="tb" spellcheck="true" placeholder="${n === 0 ? E(ph) : ''}"><button type="button" class="btn subtle">Remove</button></div>`);
+        const inp = r.querySelector('input'); inp.value = v;
+        inp.oninput = () => { arr[n] = inp.value; };
+        r.querySelector('button').onclick = () => { arr.splice(n, 1); paint(); };
+        box.appendChild(r);
+      });
+      if (arr.length < max) {
+        const add = el('<button type="button" class="btn subtle" style="align-self:flex-start">Add another</button>');
+        add.onclick = () => { arr.push(''); paint(); box.querySelectorAll('input')[arr.length - 1].focus(); };
+        box.appendChild(add);
+      }
+    };
+    paint();
+    return box;
+  }
+
+  // Sports: which teams, each with its league (they also get final-score alerts).
+  function teamRows(ui) {
+    const s = el('<div class="su-sub"><label>Sports: your teams. You get the final score after every game, and their news in the brief.</label><div class="su-list"></div></div>');
+    const box = s.querySelector('.su-list');
+    const paint = () => {
+      box.innerHTML = '';
+      if (!ui.teams.length) ui.teams.push({ league: 'NHL', team: '' });
+      ui.teams.forEach((t, n) => {
+        const r = el(`<div class="row"><select class="tb" style="flex:0 0 150px">${LEAGUES.map(l => `<option ${l === t.league ? 'selected' : ''}>${E(l)}</option>`).join('')}</select>
+          <input class="tb" spellcheck="false" placeholder="${n === 0 ? 'Team name' : ''}"><button type="button" class="btn subtle">Remove</button></div>`);
+        r.querySelector('select').onchange = e => { t.league = e.target.value; };
+        const inp = r.querySelector('input'); inp.value = t.team || '';
+        inp.oninput = () => { t.team = inp.value; };
+        r.querySelector('button').onclick = () => { ui.teams.splice(n, 1); paint(); };
+        box.appendChild(r);
+      });
+      const add = el('<button type="button" class="btn subtle" style="align-self:flex-start">Add a team</button>');
+      add.onclick = () => { ui.teams.push({ league: ui.teams[ui.teams.length - 1]?.league || 'NHL', team: '' }); paint(); };
+      box.appendChild(add);
+    };
+    paint();
+    return s;
   }
 
   /* -------------------------------------------------------- 4 claude -- */
@@ -451,14 +906,20 @@
   }
 
   /* -------------------------------------------------------- 6 bridge -- */
-  const STAGES = [['packages', 'Packages', 'a few minutes'], ['toolchains', 'Go and Rust', '5 to 10 min'], ['source', 'Source code', 'a few minutes'],
+  const BUILD_STAGES = [['packages', 'Packages', 'a few minutes'], ['toolchains', 'Go and Rust', '5 to 10 min'], ['source', 'Source code', 'a few minutes'],
     ['build', 'Build', '20 to 40 min'], ['synapse', 'Message server', 'a few minutes'], ['bridge-config', 'Settings', 'under a minute']];
+  const DOWNLOAD_STAGES = [['packages', 'Packages', 'a few minutes'], ['download', 'The bridge', 'a minute'],
+    ['synapse', 'Message server', 'a few minutes'], ['bridge-config', 'Settings', 'under a minute']];
+  let STAGES = BUILD_STAGES;
   function bridge(head, body) {
-    header(head, 'Step 6', 'Build the iMessage bridge',
-      'This builds the piece that lets the bots send and receive iMessages. It runs by itself and takes 30 to 60 minutes. You can leave it and come back, as long as the app stays open.');
+    // A kit with a prebuilt bridge downloads it; otherwise it gets compiled here.
+    STAGES = S.st.bridgeRelease ? DOWNLOAD_STAGES : BUILD_STAGES;
+    header(head, 'Step 6', 'Set up the iMessage bridge', S.st.bridgeRelease
+      ? 'This installs the piece that lets the bots send and receive iMessages. It runs by itself and takes about 10 minutes.'
+      : 'This builds the piece that lets the bots send and receive iMessages. It runs by itself and takes 30 to 60 minutes. You can leave it and come back, as long as the app stays open.');
     const row = el('<div class="su-stages"></div>');
-    const con = consoleBox('Bridge build');
-    const go = el('<button class="btn accent">Build it</button>');
+    const con = consoleBox('Bridge setup');
+    const go = el(`<button class="btn accent">${S.st.bridgeRelease ? 'Set it up' : 'Build it'}</button>`);
     body.append(row, el('<div></div>'), con);
     body.insertBefore(go, con);
     const paint = (cur, failed) => {
@@ -469,7 +930,7 @@
         row.appendChild(el(`<div class="su-stage ${done ? 'ok' : ''} ${cur === id ? 'on' : ''} ${failed === id ? 'bad' : ''}"><b>${E(t)}</b><span>${E(d)}</span></div>`));
       });
       S.ok.bridge = STAGES.every(([id]) => (steps['bridge:' + id] || {}).status === 'done');
-      go.textContent = S.ok.bridge ? 'Built' : Object.keys(steps).some(k => k.startsWith('bridge:')) ? 'Keep going' : 'Build it';
+      go.textContent = S.ok.bridge ? 'Done' : Object.keys(steps).some(k => k.startsWith('bridge:')) ? 'Keep going' : (S.st.bridgeRelease ? 'Set it up' : 'Build it');
       go.disabled = S.ok.bridge;
       refresh();
     };
@@ -478,13 +939,13 @@
       for (const [id, t] of STAGES) {
         if (((S.st.steps || {})['bridge:' + id] || {}).status === 'done') continue;
         paint(id);
-        con.querySelector('.ttl').textContent = `Bridge build: ${t}`;
+        con.querySelector('.ttl').textContent = `Bridge: ${t}`;
         const p = await con.run('bridge_stage', { stage: id });
         S.st = await api('setup_state');
         if (p.code !== 0) { paint(null, id); msg(`${t} failed. The log above says why. Press Keep going to retry from there.`, true); go.disabled = false; return; }
       }
       paint(null);
-      msg('The bridge is built.');
+      msg('The bridge is ready.');
     };
     paint(null);
   }
@@ -520,6 +981,13 @@
       if (S.ok.mac) msg('Mac identity saved.');
       refresh();
     };
+    if (S.st.dry) {
+      // A made-up Intel Mac, so the test run can get past this step without one.
+      box.querySelector('textarea').value = JSON.stringify({ cpu: 'intel', model: 'MacBookPro12,1', serial: 'C02TEST0FAKE',
+        mlb: 'C02TESTFAKE0000A1', uuid: '00000000-1111-2222-3333-444444444444', disk_uuid: '55555555-6666-7777-8888-999999999999',
+        board_id: 'Mac-E43C1C25D4880AD6', rom: 'a1b2c3d4e5f6', mac: 'a4:83:e7:00:00:01', build: '22G513', version: '13.6.4', darwin: '22.6.0' });
+      box.appendChild(el('<div class="hint">Test run: a made-up Mac is filled in. Press Save it.</div>'));
+    }
     body.append(box, save, con);
   }
 
@@ -547,23 +1015,41 @@
     paintAlias();
     body.appendChild(form);
     body.appendChild(info('warn', '<b>One try at a time.</b> Apple locks accounts that sign in over and over. If it fails, read what it says before trying again. The button waits 15 minutes between tries.'));
-    const con = consoleBox('Apple sign-in', { input: true });
-    const go = el('<button class="btn accent">Sign in now</button>');
+    // The password is typed here and handed to the login when it asks. It's
+    // never saved: not in .env, not in the log.
+    const pw = el(`<div class="su-field"><label>The bot’s Apple ID password</label>
+      <span class="su-pw"><input class="tb" type="password" spellcheck="false" autocomplete="off"><button type="button" class="eye" title="Show"></button></span>
+      <div class="hint">Only used for this sign-in. It isn’t saved anywhere.</div><div class="err hidden"></div></div>`);
+    const pwIn = pw.querySelector('input'), eye = pw.querySelector('.eye');
+    eye.textContent = '';
+    eye.onclick = () => { pwIn.type = pwIn.type === 'password' ? 'text' : 'password'; };
+    clearOnEdit(pw);
+    form.insertBefore(pw, alias);
+    const signin = askBox('Apple sign-in', {
+      doneText: 'Signed in. The bots can use iMessage now.',
+      answers: {
+        apple_id: () => form.querySelector('[data-key="BOT_APPLE_ID"] input').value.trim(),
+        password: () => { const v = pwIn.value; pwIn.value = ''; return v; },
+      },
+    });
+    const go = el('<button class="btn accent">Sign in</button>');
     go.onclick = async () => {
+      if (!pwIn.value) {
+        pw.classList.add('bad'); const e = pw.querySelector('.err'); e.textContent = 'Type the password first.'; e.classList.remove('hidden');
+        return;
+      }
       if (!await saveFields(form, ['BOT_APPLE_ID'])) return;
       go.disabled = true;
-      if (!body.querySelector('.su-answer')) { const n = info('', 'Answer the questions in the box under the log: the Apple ID, its password, then the 6-digit code Apple sends to your phone.'); n.classList.add('su-answer'); body.insertBefore(n, con); }
-      const p = await con.run('apple_login');
-      if (p.error) msg(p.error, true);
+      const p = await signin.run('apple_login');
+      if (p.error) { msg(p.error, true); pwIn.value = ''; }
       S.ok.apple = p.code === 0;
-      msg(S.ok.apple ? 'Signed in.' : 'It didn’t sign in. The log says why.', !S.ok.apple);
       S.st = await api('setup_state');
       go.disabled = S.ok.apple;
+      if (!S.ok.apple) go.textContent = 'Try again';
       refresh();
     };
     if (S.st.loginWait > 0) msg(`You can try signing in again in ${Math.ceil(S.st.loginWait / 60)} minutes.`);
-    con.classList.add('hidden');
-    body.append(go, con);
+    body.append(go, signin);
     S.ok.apple = ((S.st.steps || {}).apple_login || {}).status === 'done';
     refresh();
   }
@@ -587,40 +1073,16 @@
     body.append(go, con);
   }
 
-  /* -------------------------------------------------------- 10 extras -- */
+  /* -------------------------------------------------------- add-ons -- */
   function extras(head, body) {
-    header(head, 'Step 10', 'Extras', 'All optional. Each one makes the bots more useful. Skip any of them and add it later from here.');
-    const card = (title, text, fields, test, links) => {
-      const c = el(`<div class="su-card su-extra"><h3>${E(title)}</h3><p>${text}</p><div class="row"></div></div>`);
-      const row = c.querySelector('.row');
-      fields.forEach(f => row.appendChild(field(...f)));
-      const con = consoleBox(title, { input: test === 'icloud' });
-      con.classList.add('hidden');
-      const b = el(`<button class="btn accent">${test === 'icloud' ? 'Sign in' : 'Save and test'}</button>`);
-      b.onclick = async () => {
-        b.disabled = true;
-        if (fields.length && !await saveFields(row)) { b.disabled = false; return; }
-        if (test) { con.classList.remove('hidden'); const p = await con.run('test', { what: test }); msg(p.code === 0 ? `${title}: works.` : `${title}: didn't work. The log says why.`, p.code !== 0); }
-        b.disabled = false;
-      };
-      row.appendChild(b);
-      (links || []).forEach(([t, u]) => { const a = el(`<button class="btn subtle"><i class="ico">${I.open}</i>${E(t)}</button>`); a.onclick = () => api('setup_open', u); row.appendChild(a); });
-      c.appendChild(con);
-      return c;
-    };
-    body.appendChild(card('Calendar', 'Lets Atlas read and add events on your iCloud calendar. Needs an app-specific password for <b>your</b> Apple ID.',
-      [['APPLE_ID', 'Your Apple ID'], ['APPLE_APP_PASSWORD', 'App-specific password', { secret: true, ph: 'abcd-efgh-ijkl-mnop' }]], 'calendar',
-      [['Make an app password', 'https://account.apple.com/account/manage']]));
-    body.appendChild(card('Reminders', 'Lets Atlas make real reminders on your iPhone. Signs in to your iCloud once, with a 2FA code.', [], 'icloud'));
-    body.appendChild(card('Gmail', 'Lets Atlas tell you about real emails and watch for ones you’re waiting on.',
-      [['GMAIL_ADDRESS', 'Gmail address'], ['GMAIL_APP_PASSWORD', 'App password', { secret: true }]], 'gmail',
-      [['Make an app password', 'https://myaccount.google.com/apppasswords']]));
-    body.appendChild(card('Other calendars', 'Team schedules, school, anything with a calendar link (.ics). Paste the links, separated by commas.',
-      [['ICS_FEEDS', 'Calendar links', { full: true, ph: 'https://...ics, webcal://...' }]], 'feeds'));
-    body.appendChild(card('Iris’s email', 'Gives Iris her own email address for emailing people for you. Use a separate Gmail with an app password.',
-      [['IRIS_EMAIL_ADDRESS', 'Iris’s Gmail'], ['IRIS_EMAIL_APP_PASSWORD', 'App password', { secret: true }]], 'iris_email'));
-    body.appendChild(card('Pictures for Iris', 'A free Pixabay key lets Iris find real photos to send. Memes work without it.',
-      [['PIXABAY_KEY', 'Pixabay key', { secret: true }]], null, [['Get a key', 'https://pixabay.com/api/docs/']]));
+    header(head, 'Step 12', 'Add-ons', 'Extra things Atlas can do. All optional: connect what you want now, the rest any time from Add-ons in the app.');
+    const wants = new Set(picked());
+    const push = [wants.has('schedule') && 'your calendar (and Reminders)', wants.has('email') && 'Gmail'].filter(Boolean);
+    if (push.length) body.appendChild(info('', `You picked ${wants.has('schedule') && wants.has('email') ? 'your schedule and email' : wants.has('schedule') ? 'your schedule' : 'email'}, so connect ${push.join(' and ')} here. Atlas can’t do that part without it.`));
+    const box = el('<div></div>');
+    body.appendChild(box);
+    if (window.Addons) Addons.render(box, { mode: 'setup' });
+    else body.appendChild(info('bad', 'The add-ons part of the app is missing (App\addons.js).'));
   }
 
   /* -------------------------------------------------------- 11 finish -- */
@@ -644,5 +1106,5 @@
     body.append(go, con, done);
   }
 
-  window.Setup = { open, close };
+  window.Setup = { open, close, askBox, consoleBox };
 })();

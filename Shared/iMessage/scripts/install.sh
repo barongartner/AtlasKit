@@ -13,6 +13,8 @@
 #   toolchains     Rust and Go for the build, in the user's home
 #   source         clone the bridge and rustpush at the pinned commits, apply the patches
 #   build          compile the bridge (long: 15 to 60 minutes the first time)
+#   download       instead of toolchains+source+build: fetch the kit's prebuilt
+#                  bridge (patches/RELEASE), check its sha256, install it
 #   synapse        local Matrix homeserver in a Python venv
 #   bridge-config  bridge config + appservice registration, Synapse wired to it, bot Matrix user
 #   all            every stage after packages, in order (packages must already be done)
@@ -518,6 +520,47 @@ stage_build() {
   mark_done build
 }
 
+# The kit's prebuilt bridge: patches/RELEASE holds url=, sha256= and version=
+# lines for a tarball built from exactly these patches (matrix-rustpush plus a
+# SOURCE note, since it's AGPL). Downloading it replaces toolchains, source and
+# build: minutes instead of an hour, and no 10 GB of compilers.
+release_value() {
+  [ -f "$PATCHES/RELEASE" ] || return 1
+  sed 's/\r$//' "$PATCHES/RELEASE" | awk -F= -v k="$1" '$1==k{sub(/^[^=]*=/,""); print; exit}'
+}
+
+stage_download() {
+  need_user download
+  stage_log download
+  local url sum ver tmp got
+  url=$(release_value url) || true
+  sum=$(release_value sha256) || true
+  ver=$(release_value version) || true
+  [ -n "$url" ] && [ -n "$sum" ] || fail "This copy of the kit has no prebuilt bridge listed (patches/RELEASE). Build it instead: toolchains, source, build."
+  tmpdir; tmp="$TMP/bridge.tar.gz"
+  step "Downloading the bridge${ver:+ ($ver)}"
+  run_logged "$LAST_LOG" curl -fL --retry 3 --connect-timeout 20 -o "$tmp" "$url" \
+    || fail "The download failed. Check the internet connection and press Keep going."
+  got=$(sha256sum "$tmp" | awk '{print $1}')
+  [ "$got" = "$sum" ] || fail "The download doesn't match the kit's checksum, so it wasn't used. Press Keep going to download it again."
+  step "Unpacking it"
+  mkdir -p "$SRC" "$TMP/x"
+  tar -xzf "$tmp" -C "$TMP/x" || fail "The download is damaged. Press Keep going to download it again."
+  [ -f "$TMP/x/matrix-rustpush" ] || fail "The download doesn't have the bridge in it. Tell whoever gave you the kit."
+  install -m 755 "$TMP/x/matrix-rustpush" "$BIN.new" && mv -f "$BIN.new" "$BIN"
+  [ -f "$TMP/x/SOURCE.md" ] && cp -f "$TMP/x/SOURCE.md" "$SRC/SOURCE.md"
+  if ! "$BIN" -v >>"$LAST_LOG" 2>&1 </dev/null; then
+    tail -n 5 "$LAST_LOG" | sed 's/^/LOG: /'
+    if grep -q "error while loading shared libraries" "$LAST_LOG"; then
+      fail "The bridge is missing a system library. Run the packages stage again, then press Keep going."
+    fi
+    fail "The downloaded bridge won't start on this Linux. Build it instead: toolchains, source, build."
+  fi
+  ok "Bridge ready${ver:+ ($ver)}"
+  mark_done download
+  mark_done build  # anything that checks for a built bridge sees this one
+}
+
 stage_synapse() {
   need_user synapse
   stage_log synapse
@@ -706,7 +749,7 @@ PY
 
 # ------------------------------------------------------------------- main ----
 usage() {
-  say "ERROR: usage: install.sh <packages|toolchains|source|build|synapse|bridge-config|all|copy-scripts> [--force]"
+  say "ERROR: usage: install.sh <packages|toolchains|source|build|download|synapse|bridge-config|all|copy-scripts> [--force]"
   exit 2
 }
 STAGE=""
@@ -733,7 +776,9 @@ if [ "$(id -u)" = 0 ]; then
 else
   mkdir -p "$BRIDGE_DIR"; exec 9>"$BRIDGE_DIR/.install.lock"
 fi
-flock -n 9 || fail "Another install step is already running. Wait for it to finish."
+# A stage that just finished can leave a helper process holding the lock for a
+# few seconds (the app runs stages back to back), so wait a little first.
+flock -w 30 9 || fail "Another install step is already running. Wait for it to finish."
 
 run_stage() {
   CURRENT_STAGE=$1
@@ -746,6 +791,7 @@ run_stage() {
     toolchains) stage_toolchains ;;
     source) stage_source ;;
     build) stage_build ;;
+    download) stage_download ;;
     synapse) stage_synapse ;;
     bridge-config) stage_bridge_config ;;
   esac
@@ -753,7 +799,7 @@ run_stage() {
 }
 
 case "$STAGE" in
-  packages|toolchains|source|build|synapse|bridge-config) run_stage "$STAGE" ;;
+  packages|toolchains|source|build|download|synapse|bridge-config) run_stage "$STAGE" ;;
   copy-scripts) need_user copy-scripts; copy_scripts ;;
   all)
     need_user all

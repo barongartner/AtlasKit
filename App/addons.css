@@ -1,0 +1,109 @@
+/* Add-ons cards (addons.js). Built on the page's own tokens (--card,
+   --accent, --text-2...) and controls (.btn, .tb, .toggle, .dot, .ring) from
+   Atlas UI.html, so it follows light/dark and the Windows accent. */
+
+.ao { display: flex; flex-direction: column; gap: 6px; max-width: 980px; }
+.ao-loading { display: flex; align-items: center; gap: 10px; color: var(--text-3); padding: 18px 2px; }
+.ao-note { display: flex; gap: 10px; align-items: flex-start; padding: 10px 14px; border-radius: 6px; border: 1px solid var(--card-stroke);
+  background: var(--card); color: var(--text); }
+.ao-note .ico { margin-top: 2px; color: var(--accent); }
+.ao-note.warn { background: var(--warn-bg); } .ao-note.warn .ico { color: var(--warn); }
+.ao-note.bad { background: var(--bad-bg); } .ao-note.bad .ico { color: var(--bad); }
+
+.ao-group + .ao-group { margin-top: 18px; }
+.ao-gtitle { font-weight: 600; margin: 4px 0 0; }
+.ao-gsub { font-size: 12px; line-height: 16px; color: var(--text-3); margin: 2px 0 10px; }
+.ao-cards { display: flex; flex-direction: column; gap: 4px; }
+
+/* ------------------------------------------------------------- card -- */
+.ao-card { background: var(--card); border: 1px solid var(--card-stroke); border-radius: 8px; overflow: hidden; }
+.ao-head { display: flex; align-items: center; gap: 14px; padding: 12px 14px 12px 16px; min-height: 64px; }
+.ao-head:hover { background: var(--subtle-hover); }
+.ao-head:active { background: var(--subtle-press); }
+.ao-tile { width: 36px; height: 36px; border-radius: 8px; flex: none; display: grid; place-items: center;
+  background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); }
+.ao-tile .ico { font-size: 18px; }
+.ao-card.off .ao-tile { background: var(--subtle-hover); color: var(--text-3); }
+.ao-id { flex: 1; min-width: 0; }
+.ao-name { font-weight: 600; }
+.ao-desc { font-size: 12px; line-height: 16px; color: var(--text-2); margin-top: 1px; }
+.ao-card.off .ao-name, .ao-card.off .ao-desc { color: var(--text-3); }
+
+.ao-pill { display: inline-flex; align-items: center; gap: 7px; height: 24px; padding: 0 10px; border-radius: 12px; flex: none;
+  font-size: 12px; font-weight: 600; background: var(--subtle-hover); color: var(--text-2); white-space: nowrap; }
+.ao-pill.ok { background: var(--ok-bg); color: var(--ok); }
+.ao-pill.bad { background: var(--bad-bg); color: var(--bad); }
+.ao-pill.off { color: var(--text-3); }
+.ao-pill .dot.off { background: var(--text-dis); }
+.ao-switch { flex: none; }
+.ao-chev { font-size: 12px; color: var(--text-3); width: 16px; text-align: center; transition: transform 0.15s; }
+.ao-card.open .ao-chev { transform: rotate(180deg); }
+
+.ao-body { display: none; padding: 4px 18px 16px 66px; border-top: 1px solid var(--divider); }
+.ao-card.open .ao-body { display: block; }
+.ao-body > * { margin-top: 12px; }
+.ao-needs { color: var(--text-2); }
+.ao-needs b { color: var(--text); font-weight: 600; }
+.ao-state { font-size: 12px; line-height: 16px; color: var(--text-3); margin-top: 4px !important; }
+.ao-state:empty { display: none; }
+.ao-state.ok { color: var(--ok); }
+.ao-state.bad { color: var(--bad); }
+
+.ao-steps { margin: 12px 0 0; padding-left: 20px; color: var(--text-2); }
+.ao-steps li { margin: 3px 0; user-select: text; }
+
+.ao-copy { display: flex; align-items: stretch; border-radius: 6px; border: 1px solid var(--card-stroke); background: var(--code); overflow: hidden; max-width: 620px; }
+.ao-copy .lb { display: flex; align-items: center; padding: 0 12px; font-size: 12px; color: var(--text-3); border-right: 1px solid var(--card-stroke); white-space: nowrap; }
+.ao-copy code { flex: 1; min-width: 0; padding: 8px 12px; font: 12px/18px var(--mono); color: var(--text); white-space: nowrap; overflow: auto; user-select: text; }
+.ao-copy .btn { height: auto; border-radius: 0; border: 0; border-left: 1px solid var(--card-stroke); }
+
+.ao-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px 16px; }
+.ao-field label { display: block; margin-bottom: 6px; font-size: 13px; }
+.ao-field .opt { color: var(--text-3); font-size: 12px; }
+.ao-field .tb { width: 100%; }
+.ao-field .hint { font-size: 12px; color: var(--text-3); margin-top: 4px; line-height: 16px; }
+.ao-field .err { font-size: 12px; color: var(--bad); margin-top: 4px; line-height: 16px; }
+.ao-field.bad .tb { border-bottom-color: var(--bad); }
+.ao-flink { height: 24px; padding: 0 6px; margin: 4px 0 0 -6px; font-size: 12px; color: var(--accent); }
+.ao-flink .ico { font-size: 12px; }
+
+.ao-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ao-actions .btn { min-width: 84px; }
+.ao-actions .ao-link { min-width: 0; color: var(--text-2); }
+
+.ao-result { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: 6px; border: 1px solid var(--card-stroke);
+  background: var(--card-solid); }
+.ao-result .ic { width: 16px; flex: none; margin-top: 2px; display: grid; place-items: center; }
+.ao-result .ic .ico { font-size: 14px; }
+.ao-result.ok .ic { color: var(--ok); }
+.ao-result.bad { background: var(--bad-bg); }
+.ao-result.bad .ic { color: var(--bad); }
+.ao-result .tx { flex: 1; min-width: 0; user-select: text; word-break: break-word; }
+.ao-result .more { height: 24px; padding: 0 8px; font-size: 12px; margin: -2px -4px -2px 0; }
+.ao-lines { margin: 8px 0 0; padding: 10px 12px; border-radius: 6px; background: var(--code); font: 12px/18px var(--mono); color: var(--text-2);
+  max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-word; user-select: text; }
+
+/* console for sign-ins that ask questions (same look as the setup console) */
+.ao-con { border-radius: 8px; border: 1px solid var(--card-stroke); background: #0c0c0c; overflow: hidden; display: flex; flex-direction: column; }
+:root.light .ao-con { background: #1b1b1b; }
+.ao-con .bar { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: rgba(255,255,255,0.04);
+  border-bottom: 1px solid rgba(255,255,255,0.06); color: rgba(255,255,255,0.8); font-size: 12px; }
+.ao-con pre { margin: 0; padding: 10px 14px; height: 150px; overflow: auto; font: 12px/18px var(--mono); color: rgba(255,255,255,0.78);
+  white-space: pre-wrap; word-break: break-word; user-select: text; }
+.ao-con pre .s { color: rgba(255,255,255,0.95); }
+.ao-con pre .o { color: #6ccb5f; }
+.ao-con pre .w { color: #fce100; }
+.ao-con pre .e { color: #ff99a4; }
+.ao-con pre .r { color: #60cdff; }
+.ao-con .in { display: flex; gap: 8px; padding: 8px 10px; border-top: 1px solid rgba(255,255,255,0.06); }
+.ao-con .in .tb { flex: 1; background: rgba(255,255,255,0.06); color: #fff; border-color: rgba(255,255,255,0.08); font-family: var(--mono); font-size: 12px; }
+.ao-con .in .btn { color: #fff; background: rgba(255,255,255,0.08); border-color: rgba(255,255,255,0.1); }
+
+/* setup mode: lighter, everything closed until opened */
+.ao-setup { max-width: none; }
+.ao-setup .ao-head { min-height: 56px; padding: 10px 12px 10px 14px; }
+.ao-setup .ao-tile { width: 32px; height: 32px; }
+.ao-setup .ao-desc { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ao-setup .ao-card.open .ao-desc { white-space: normal; }
+.ao-setup .ao-body { padding-left: 60px; }
+.ao-setup .ao-gsub { margin-bottom: 8px; }

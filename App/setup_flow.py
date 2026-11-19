@@ -44,7 +44,7 @@ NO_WINDOW = 0x08000000
 NEW_CONSOLE = 0x00000010
 SECRET = re.compile(r"TOKEN|PASSWORD|SECRET|KEY$", re.I)
 WSL_USER_DEFAULT = "atlas"
-BRIDGE_STAGES = ["packages", "toolchains", "source", "build", "synapse", "bridge-config"]
+BRIDGE_STAGES = ["packages", "toolchains", "source", "build", "download", "synapse", "bridge-config"]
 LOGIN_COOLDOWN = 15 * 60   # seconds between Apple login attempts; hammering got an account throttled
 
 sys.path.insert(0, str(SHARED))
@@ -120,13 +120,95 @@ WIN_TZ = {
     "Romance Standard Time": "Europe/Paris", "Central Europe Standard Time": "Europe/Budapest",
     "AUS Eastern Standard Time": "Australia/Sydney", "New Zealand Standard Time": "Pacific/Auckland",
     "India Standard Time": "Asia/Kolkata", "Tokyo Standard Time": "Asia/Tokyo",
+    # A province that went to permanent UTC-6 in Nov 2026; Windows gave it its own zone
+    # and tzdata kept the old name with the new rule.
+    "Alberta Standard Time": "America/Edmonton",
+    "Mountain Standard Time (Mexico)": "America/Mazatlan", "Central America Standard Time": "America/Guatemala",
+    "SA Pacific Standard Time": "America/Bogota", "E. South America Standard Time": "America/Sao_Paulo",
+    "Greenwich Standard Time": "Atlantic/Reykjavik", "E. Europe Standard Time": "Europe/Chisinau",
+    "FLE Standard Time": "Europe/Kiev", "GTB Standard Time": "Europe/Bucharest", "Russian Standard Time": "Europe/Moscow",
+    "South Africa Standard Time": "Africa/Johannesburg", "Arabian Standard Time": "Asia/Dubai",
+    "China Standard Time": "Asia/Shanghai", "Singapore Standard Time": "Asia/Singapore",
+    "Korea Standard Time": "Asia/Seoul", "W. Australia Standard Time": "Australia/Perth",
+    "E. Australia Standard Time": "Australia/Brisbane", "Cen. Australia Standard Time": "Australia/Adelaide",
 }
+
+# The walkthrough's picker; an unknown Windows zone falls back to the first of
+# these with the same UTC offset right now.
+TZ_CHOICES = ["America/St_Johns", "America/Halifax", "America/Toronto", "America/New_York", "America/Winnipeg",
+              "America/Chicago", "America/Regina", "America/Edmonton", "America/Denver", "America/Phoenix",
+              "America/Vancouver", "America/Los_Angeles", "America/Anchorage", "Pacific/Honolulu", "Europe/London",
+              "Europe/Dublin", "Europe/Paris", "Europe/Berlin", "Europe/Madrid", "Europe/Rome", "Europe/Amsterdam",
+              "Europe/Stockholm", "Europe/Athens", "Asia/Dubai", "Asia/Kolkata", "Asia/Singapore", "Asia/Tokyo",
+              "Asia/Seoul", "Australia/Perth", "Australia/Brisbane", "Australia/Sydney", "Pacific/Auckland"]
 
 
 def windows_tz() -> tuple[str, str]:
     code, out = run(["tzutil", "/g"], timeout=10)
     win = out.strip() if code == 0 else ""
-    return win, WIN_TZ.get(win, "")
+    iana = WIN_TZ.get(win, "")
+    if not iana:
+        from zoneinfo import ZoneInfo
+        here = datetime.now().astimezone().utcoffset()
+        iana = next((z for z in TZ_CHOICES if datetime.now(ZoneInfo(z)).utcoffset() == here), "")
+    return win, iana
+
+
+# What the owner can pick in "What do you want Atlas for?". The text is what
+# Atlas's CLAUDE.md says about each pick ({OWNER_WANTS} in the template).
+USES = {
+    "brief": "A daily brief every morning: weather, their day, and the news they care about (Library\\News.md).",
+    "track": "Keeping them on track: reminders, deadlines, and following up until things are actually done.",
+    "goals": "Goals and habits: regular check-ins on what's in Library\\Goals.md and Library\\Habits.md.",
+    "schedule": "Running their schedule: the calendar, plans, and answering \"am I free Thursday\".",
+    "email": "Email: a heads-up on the emails that matter, and drafting replies when they ask.",
+    "remember": "Remembering things: filing whatever they send you so they can ask for it later.",
+    "iris": "Iris texting people for them (that's Iris's job; pass those requests to her on the bus).",
+}
+
+
+def wants_text(env: dict) -> str:
+    picks = [p for p in (env.get("OWNER_WANTS") or "").split(",") if p in USES]
+    if not picks:
+        return ("They haven't said yet what they mainly want from you. Be generally useful, "
+                "and notice what they lean on you for.")
+    lines = [f"- {USES[p]}" for p in picks]
+    unasked = {"brief": "a morning brief", "track": "chasing them about to-dos",
+               "goals": "goal or habit check-ins", "email": "email reports"}
+    skipped = [unasked[p] for p in unasked if p not in picks]
+    tail = (f"\nThey didn't ask for {', '.join(skipped[:-1]) + ' or ' if len(skipped) > 1 else ''}{skipped[-1]}, "
+            "so don't start those on your own. If they ask for one later, do it and note it in Memories\\Memory.md.") \
+        if skipped else ""
+    return "\n".join(lines) + tail
+
+
+def city_search(q: str) -> list[dict]:
+    """Cities matching what's typed, from Open-Meteo's free geocoder (no key).
+    Each comes with its time zone and coordinates, so picking a city also
+    picks the time zone and gives the weather a real location."""
+    import requests
+    q = (q or "").strip()
+    if len(q) < 2:
+        return []
+    try:
+        r = requests.get("https://geocoding-api.open-meteo.com/v1/search",
+                         params={"name": q, "count": 8, "language": "en", "format": "json"},
+                         headers={"User-Agent": "atlas-setup/1.0"}, timeout=8)
+        r.raise_for_status()
+        found = r.json().get("results") or []
+    except Exception:
+        return [{"error": "Couldn't search cities. Check the internet connection."}]
+    out, seen = [], set()
+    for c in found:
+        parts = [c.get("name"), c.get("admin1"), c.get("country")]
+        label = ", ".join(dict.fromkeys(p for p in parts if p))
+        if label in seen:
+            continue
+        seen.add(label)
+        out.append({"label": label, "name": c.get("name", ""), "region": c.get("admin1", ""),
+                    "country": c.get("country", ""), "lat": c.get("latitude"), "lon": c.get("longitude"),
+                    "timezone": c.get("timezone", ""), "population": c.get("population") or 0})
+    return out
 
 
 # ------------------------------------------------------------------ jobs --
@@ -267,6 +349,18 @@ class Job:
                                                for k, v in self.results.items()}}
 
 
+def bridge_release() -> str:
+    """The prebuilt bridge's version when the kit lists one (patches/RELEASE), else ""."""
+    f = IM_DIR / "patches" / "RELEASE"
+    try:
+        vals = dict(l.split("=", 1) for l in f.read_text(encoding="utf-8").splitlines() if "=" in l)
+    except OSError:
+        return ""
+    if not (vals.get("url", "").strip() and vals.get("sha256", "").strip()):
+        return ""
+    return vals.get("version", "").strip() or "prebuilt"
+
+
 def fake(*lines: str, step: float = 0.6) -> list[tuple[float, str]]:
     return [(step, l) for l in lines]
 
@@ -330,7 +424,8 @@ class SetupMixin:
         return {"dry": DRY, "steps": st.get("steps", {}), "env": shown, "secretsSet": have,
                 "windowsTz": win, "windowsTzIana": iana, "kit": str(ROOT),
                 "loginWait": max(0, int(LOGIN_COOLDOWN - (time.time() - last))),
-                "macCommand": self._mac_command(), "distro": self._distro()}
+                "macCommand": self._mac_command(), "distro": self._distro(), "tailor": st.get("tailor", {}),
+                "bridgeRelease": bridge_release()}
 
     def setup_mark(self, step, status):
         st = self._state()
@@ -348,9 +443,18 @@ class SetupMixin:
         if not isinstance(values, dict):
             return {"ok": False, "errors": {"_": "Nothing to save."}}
         errors, clean = {}, {}
+        email_mode = bool(str(values.get("OWNER_IMESSAGE") or "").strip())
         for k, v in values.items():
             v = str(v or "").strip()
-            if k == "OWNER_PHONE":
+            if k == "OWNER_PHONE" and not v and email_mode:
+                pass  # they text from their Apple ID email instead of a number
+            elif k == "OWNER_IMESSAGE":
+                handles = [h.strip() for h in v.split(",") if h.strip()]
+                bad = [h for h in handles if "@" in h and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", h)]
+                if bad:
+                    errors[k] = "That doesn't look like an email address."
+                v = ",".join(h.lower() if "@" in h else (normalize_phone(h) or h) for h in handles)
+            elif k == "OWNER_PHONE":
                 p = normalize_phone(v)
                 if re.sub(r"\D", "", v) in EMERGENCY:
                     errors[k] = ("Atlas texting the cops your morning brief every day is one way to meet them. "
@@ -378,10 +482,156 @@ class SetupMixin:
             clean[k] = v
         if errors:
             return {"ok": False, "errors": errors}
-        if "OWNER_EMAIL" in clean and not clean.get("OWNER_IMESSAGE"):
-            pass  # the owner's email is never trusted as an owner handle automatically
+        # OWNER_EMAIL (Gmail checks, calendar) is never trusted as an owner
+        # handle by itself: only what's in OWNER_PHONE or OWNER_IMESSAGE is.
         self._write_env(clean)
+        if clean.get("OWNER_NAME") or "OWNER_WANTS" in clean:
+            self._fill_placeholders()
         return {"ok": True, "errors": {}}
+
+    def setup_city_search(self, q):
+        return city_search(q)
+
+    # ----- "Make it yours": the brief, news, goals and habits -----
+
+    def setup_tailor(self, data):
+        """Write the follow-up answers into Atlas's Library. `data`:
+        brief_time ("07:30", "random 09:00-10:00" or "off"), beats (list of
+        {label, text} in order), goals (list of str), habits (list of
+        {name, gist}), teams (list of {league, team}). Saved in setup.json too,
+        so the step shows the answers again. In a dry run the files go to
+        Shared\\setup-dryrun-preview\\Atlas\\Library instead."""
+        if not isinstance(data, dict):
+            return {"ok": False, "message": "Nothing to save."}
+        lib = ROOT / "Atlas" / "Library"
+        out_dir = SHARED / "setup-dryrun-preview" / "Atlas" / "Library" if DRY else lib
+        out_dir.mkdir(parents=True, exist_ok=True)
+        name = self._env_values().get("OWNER_NAME") or owner.NAME
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        def read(fname):
+            for p in (out_dir / fname, lib / fname):
+                if p.exists():
+                    return p.read_text(encoding="utf-8").replace("{OWNER_NAME}", name)
+            return ""
+
+        def write(fname, text):
+            (out_dir / fname).write_text(text.rstrip() + "\n", encoding="utf-8")
+
+        def clean(s, n=300):
+            return re.sub(r"\s+", " ", str(s or "")).strip()[:n]
+
+        # Settings.md: the brief time
+        bt = clean(data.get("brief_time")) or "random 09:00-10:00"
+        if not re.fullmatch(r"off|random \d{1,2}:\d{2}-\d{1,2}:\d{2}|\d{1,2}:\d{2}", bt):
+            bt = "random 09:00-10:00"
+        s = read("Settings.md")
+        if s:
+            s = re.sub(r"(?m)^- Brief time:.*$", f"- Brief time: {bt}", s)
+            write("Settings.md", s)
+
+        # News.md: the beats, in their order
+        beats = [b for b in (data.get("beats") or []) if isinstance(b, dict) and clean(b.get("label"))]
+        n = read("News.md")
+        if n and beats:
+            lines = [f"{i}. **{clean(b['label'], 60)}** - {clean(b.get('text'))}" for i, b in enumerate(beats, 1)]
+            section = ("## The beats, in this order\n\nOne item per beat, two at most on a big day. Skip a beat if nothing "
+                       "real happened in the last 24 to 48 hours, but never skip the whole section.\n\n" + "\n".join(lines) +
+                       f"\n\n{name} picked these in setup. Add, drop or reorder beats when they ask for more or less of something, "
+                       "and note new interests you learn about here.\n")
+            n = re.sub(r"(?s)## The beats, in this order\n.*?(?=\n## |\Z)", section.rstrip("\n") + "\n", n, count=1)
+            write("News.md", n)
+
+        # Goals.md and Habits.md: add what's new under Active
+        def add_under_active(fname, entries):
+            text = read(fname)
+            if not text or not entries:
+                return
+            fresh = [e for e in entries if e.split("\n")[0] not in text]
+            if fresh:
+                text = text.replace("## Active\n", "## Active\n\n" + "\n".join(fresh) + "\n", 1)
+                write(fname, re.sub(r"\n{3,}", "\n\n", text))
+
+        goals = [clean(g) for g in (data.get("goals") or []) if clean(g)]
+        add_under_active("Goals.md", [f"- {g} (since {today})" for g in goals])
+        habits = [h for h in (data.get("habits") or []) if isinstance(h, dict) and clean(h.get("name"))]
+        cap = lambda s: s[:1].upper() + s[1:]
+        add_under_active("Habits.md", [f"### {cap(clean(h['name'], 60))}\n- Started: {today}\n- The gist: {clean(h.get('gist')) or clean(h['name'])}\n- Log:"
+                                       for h in habits])
+
+        # Sports teams become watches (final scores), when the watches system is in.
+        teams = [t for t in (data.get("teams") or []) if isinstance(t, dict) and clean(t.get("team"))]
+        warn = ""
+        add_teams = getattr(self, "watches_add_teams", None)
+        if teams and add_teams and not DRY:
+            try:
+                res = add_teams([{"league": t.get("league"), "team": t.get("team")} for t in teams])
+                bad = [f"{e['team']} ({e['league']})" for e in (res or {}).get("errors", [])]
+                if bad:
+                    warn = (f"Couldn't find {', '.join(bad)} for score alerts. They're still in the brief; "
+                            "fix the name on the Watches page.")
+            except Exception as e:
+                warn = f"The score alerts didn't save ({e}). Add them on the Watches page."
+
+        st = self._state()
+        st["tailor"] = data
+        self._save_state(st)
+        where = "Shared\\setup-dryrun-preview" if DRY else "Atlas's Library"
+        return {"ok": True, "message": f"Saved to {where}.", "warn": warn}
+
+    # ----- the owner's name (and what they want Atlas for) in the bots' files -----
+
+    def _fill_placeholders(self) -> list[str]:
+        """Put the owner's name (and their picks) into the bots' files.
+
+        CLAUDE.md files keep a CLAUDE.template.md copy with the placeholders,
+        so a changed name or new picks are filled in again from scratch. The
+        starter Library and Memories files are the bots' own to edit, so they
+        get filled once in place; a later name change swaps the old name for
+        the new one in them. In a dry run nothing real changes: filled copies
+        go to Shared\\setup-dryrun-preview\\ to look at instead."""
+        env = self._env_values()
+        name = env.get("OWNER_NAME", "").strip()
+        if not name:
+            return []
+        fills = {"{OWNER_NAME}": name, "{OWNER_WANTS}": wants_text(env)}
+        st = self._state()
+        old = st.get("filled_name", "")
+        preview = SHARED / "setup-dryrun-preview"
+        done = []
+        for bot in ("Atlas", "Iris"):
+            base = ROOT / bot
+            md, tpl = base / "CLAUDE.md", base / "CLAUDE.template.md"
+            files = [(md, tpl)] + [(f, None) for sub in ("Library", "Memories") for f in sorted((base / sub).glob("*.md"))]
+            for target, template in files:
+                if template is not None:
+                    if not template.exists() and target.exists():
+                        if DRY:
+                            template = target  # read the placeholder copy straight from CLAUDE.md
+                        else:
+                            shutil.copyfile(target, template)
+                    if not template.exists():
+                        continue
+                    text = template.read_text(encoding="utf-8")
+                else:
+                    if not target.exists() or target.name == "Archive.md":
+                        continue
+                    text = target.read_text(encoding="utf-8")
+                    if old and old != name and "{OWNER_NAME}" not in text:
+                        text = re.sub(rf"\b{re.escape(old)}\b", name, text)
+                new = text
+                for k, v in fills.items():
+                    new = new.replace(k, v)
+                if template is None and new == target.read_text(encoding="utf-8"):
+                    continue
+                out = preview / bot / target.relative_to(base) if DRY else target
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(new, encoding="utf-8")
+                done.append(str(target.relative_to(ROOT)))
+        st = self._state()
+        st["filled_name"] = name
+        self._save_state(st)
+        return done
 
     # ----- checks (read-only, run for real even in a dry run) -----
 
@@ -402,7 +652,8 @@ class SetupMixin:
         items.append({"id": "virt", "label": "Virtualization is turned on", "ok": virt,
                       "detail": "On" if virt else "Turn on Intel VT-x or AMD SVM in the BIOS, then come back."})
         free = shutil.disk_usage(os.environ.get("SystemDrive", "C:") + "\\").free / 2**30
-        items.append({"id": "disk", "label": "25 GB free on the system drive", "ok": free >= 25,
+        need = 8 if bridge_release() else 25  # a downloaded bridge skips the compilers and the build
+        items.append({"id": "disk", "label": f"{need} GB free on the system drive", "ok": free >= need,
                       "detail": f"{free:.0f} GB free"})
         items.append({"id": "python", "label": "Python 3.11 or newer", "ok": sys.version_info >= (3, 11),
                       "detail": sys.version.split()[0]})
@@ -602,9 +853,10 @@ class SetupMixin:
                     self.setup_mark("apple_login", "done")
             if DRY:
                 return self._start("Apple login", on_done=done, script=[
-                    (0.6, "STEP: (dry run) Starting the login"), (0.8, "ASK: apple_id Apple ID? (dry run, type anything)"),
-                    (0.4, "ASK: password Password for the Apple ID?"), (0.4, "ASK: code The 6-digit code Apple sent?"),
-                    (1.0, "OK: (dry run) Logged in")])
+                    (0.6, "STEP: (dry run) Starting the bridge for the login"), (0.8, "ASK: apple_id Enter the bots' Apple ID (its email address)."),
+                    (0.4, "ASK: password Enter the password of the bots' Apple ID."), (1.2, "STEP: (dry run) Checking the password with Apple"),
+                    (0.8, "ASK: code Enter the 6-digit code Apple just sent (a notification on a trusted device, or a text or voice call to the trusted phone number)."),
+                    (1.0, "STEP: (dry run) Registering with iMessage"), (1.2, "OK: (dry run) Logged in")])
             return self._start("Apple login", on_done=done, argv=self._wsl("bash", f"{im}/scripts/login.sh"))
         if action == "bridge_start":
             if DRY:
@@ -696,18 +948,13 @@ class SetupMixin:
         name = owner.NAME
         if DRY:
             return self._start("Finish", script=fake(
-                f"STEP: (dry run) would fill {{OWNER_NAME}} in Atlas's and Iris's rules with {name}",
+                f"OK: (dry run) the filled-in files are in Shared\\setup-dryrun-preview, using the name {name}",
                 "STEP: (dry run) starting Atlas and Iris", "STEP: (dry run) texting you from Atlas",
                 "OK: (dry run) sent"))
 
         def finish(job):
-            for bot in ("Atlas", "Iris"):
-                md, tpl = ROOT / bot / "CLAUDE.md", ROOT / bot / "CLAUDE.template.md"
-                if not tpl.exists() and md.exists():
-                    shutil.copyfile(md, tpl)  # keep the placeholder copy so a new name can be filled in later
-                if tpl.exists():
-                    md.write_text(tpl.read_text(encoding="utf-8").replace("{OWNER_NAME}", name), encoding="utf-8")
-                    job.say(f"OK: {bot}'s rules now use the name {name}")
+            self._fill_placeholders()  # already done when About you was saved; this catches a hand-edited .env
+            job.say(f"OK: Atlas's and Iris's files use the name {name}")
             job.say("STEP: Starting Atlas and Iris")
             subprocess.Popen(["cmd", "/c", str(SHARED / "Start Crew.cmd")], creationflags=NO_WINDOW)
             for _ in range(45):  # the watchdogs start the bots; wait for Atlas to hold its lock

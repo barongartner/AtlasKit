@@ -411,6 +411,8 @@ main {
 .dialog .d-foot .btn { flex: 1; }
 </style>
 <link rel="stylesheet" href="setup.css">
+<link rel="stylesheet" href="watches.css">
+<link rel="stylesheet" href="addons.css">
 </head>
 <body>
 
@@ -420,6 +422,8 @@ main {
   <button class="nav-item" data-page="chats"><i class="ico">&#xE8BD;</i><span>Chats</span><span class="badge quiet hidden" id="navFresh"></span></button>
   <button class="nav-item" data-page="email"><i class="ico">&#xE715;</i><span>Email</span><span class="badge quiet hidden" id="navMail"></span></button>
   <button class="nav-item" data-page="memory"><i class="ico">&#xE8F1;</i><span>Memory</span></button>
+  <button class="nav-item" data-page="watches"><i class="ico">&#xE7B3;</i><span>Watches</span></button>
+  <button class="nav-item" data-page="addons"><i class="ico">&#xECAA;</i><span>Add-ons</span></button>
   <div class="spacer"></div>
   <div class="nav-status">
     <div class="ns-row"><span class="dot" id="nsCrewDot"></span><span id="nsCrew">Checking the crew...</span></div>
@@ -549,6 +553,15 @@ main {
     </div>
   </section>
 
+  <!-- Watches: email, prices, webpages, YouTube, teams (watches.js) -->
+  <section class="page" id="page-watches"><div id="watchesRoot"></div></section>
+
+  <!-- Add-ons: Spotify, Apple Music, calendar, Gmail and the rest (addons.js) -->
+  <section class="page" id="page-addons">
+    <div class="page-head"><h1>Add-ons</h1><div class="sub">Extra things Atlas can do. Connect one, test it, switch it off any time.</div></div>
+    <div id="addonsRoot"></div>
+  </section>
+
   <!-- Settings -->
   <section class="page" id="page-settings">
     <div class="page-head">
@@ -646,6 +659,8 @@ function show(page) {
   if (page === 'chats') { chatsLoad(); if (C.id) chatCheck(); }
   if (page === 'email') { mailLoad(); mailStatus(); }
   if (page === 'memory') memLoad();
+  if (page === 'watches' && window.Watches) Watches.render($('#watchesRoot'));
+  if (page === 'addons' && window.Addons) { if ($('#addonsRoot').childElementCount) Addons.refresh(); else Addons.render($('#addonsRoot'), { mode: 'page' }); }
   if (page === 'settings' && !setDirtyCount()) setLoad();
 }
 
@@ -1547,6 +1562,8 @@ async function start() {
 if (window.pywebview && window.pywebview.api && window.pywebview.api.boot) start();
 else window.addEventListener('pywebviewready', start);
 </script>
+<script src="watches.js"></script>
+<script src="addons.js"></script>
 <script src="setup.js"></script>
 </body>
 </html>

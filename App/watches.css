@@ -1,0 +1,84 @@
+/* Watches page. Built only from the app's own tokens (--accent, --text,
+   --card...) and its shared pieces (.btn, .tb, .seg, .toggle, .card,
+   .status), so it follows light/dark and the Windows accent with the rest. */
+
+.wx { display: flex; flex-direction: column; gap: 6px; }
+
+/* ------------------------------------------------------------ top bar -- */
+.wx-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.wx-count { font-size: 13px; color: var(--text-3); }
+.wx-count b { color: var(--text); font-weight: 600; }
+
+/* ------------------------------------------------------------- groups -- */
+.wx-group { margin-top: 10px; }
+.wx-ghead { display: flex; align-items: center; gap: 10px; font-weight: 600; margin: 0 0 8px; }
+.wx-ghead .ico { font-size: 16px; color: var(--accent); }
+.wx-ghead .cap { font-weight: normal; }
+.wx-card { overflow: hidden; }
+
+.wx-row { display: flex; align-items: flex-start; gap: 16px; padding: 12px 12px 12px 16px; position: relative; }
+.wx-row + .wx-row { border-top: 1px solid var(--divider); }
+.wx-row:hover { background: var(--subtle-press); }
+.wx-row.off .wx-label, .wx-row.off .wx-sum { color: var(--text-3); }
+.wx-row.busy::before { content: ""; position: absolute; left: 0; top: 14px; bottom: 14px; width: 3px; border-radius: 2px;
+  background: var(--accent); animation: wxPulse 1.2s ease-in-out infinite; }
+@keyframes wxPulse { 50% { opacity: 0.35; } }
+
+.wx-main { flex: 1; min-width: 0; }
+.wx-top { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.wx-label { font-weight: 600; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: text; }
+.wx-top .status { height: 20px; padding: 0 8px; font-size: 11px; gap: 6px; }
+.wx-top .status .dot { width: 6px; height: 6px; }
+.wx-top .status.ok .dot { background: var(--ok); }
+.wx-top .status.warn .dot { background: var(--warn); }
+.wx-top .status.bad .dot { background: var(--bad); }
+.wx-sum { margin-top: 2px; font-size: 13px; color: var(--text-2); overflow-wrap: anywhere; user-select: text; }
+.wx-meta { display: flex; flex-wrap: wrap; gap: 4px 20px; margin-top: 6px; font-size: 12px; line-height: 16px; color: var(--text-3); }
+.wx-meta span { min-width: 0; overflow-wrap: anywhere; }
+.wx-meta b { font-weight: 600; color: var(--text-2); margin-right: 5px; }
+.wx-note { margin-top: 8px; padding: 8px 10px; border-radius: 4px; background: var(--code); font-size: 12px; line-height: 18px;
+  color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; cursor: text; }
+.wx-err { display: flex; align-items: flex-start; gap: 8px; margin-top: 8px; font-size: 12px; line-height: 16px; color: var(--bad);
+  overflow-wrap: anywhere; user-select: text; }
+.wx-err .ico { font-size: 12px; margin-top: 2px; }
+.wx-acts { display: flex; align-items: center; gap: 2px; flex: none; margin-top: -2px; }
+.wx-acts .btn { height: 30px; }
+.wx-acts .btn.icon { width: 30px; }
+.wx-acts .ring { width: 14px; height: 14px; }
+
+/* -------------------------------------------------------------- empty -- */
+.wx-empty { padding: 40px 24px; display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center; color: var(--text-3); }
+.wx-empty .ico { font-size: 32px; color: var(--text-dis); }
+.wx-empty b { color: var(--text); font-weight: 600; font-size: 15px; }
+.wx-empty p { margin: 0; max-width: 440px; }
+.wx-loading { display: flex; align-items: center; gap: 10px; padding: 20px 4px; color: var(--text-3); }
+
+/* --------------------------------------------------------------- form -- */
+.wx-form { padding: 18px 20px 16px; margin-bottom: 6px; background: var(--card-solid); animation: wxIn 0.22s cubic-bezier(0.16, 1, 0.3, 1); }
+@keyframes wxIn { from { opacity: 0; transform: translateY(-4px); } }
+.wx-ftitle { font-weight: 600; font-size: 15px; margin-bottom: 12px; }
+.wx-types { margin-bottom: 16px; flex-wrap: wrap; max-width: 100%; }
+.wx-types .ico { font-size: 13px; }
+.wx-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 18px; max-width: 760px; }
+.wx-field.full { grid-column: 1 / -1; }
+.wx-field label.wx-l { display: block; margin-bottom: 6px; }
+.wx-field .opt { color: var(--text-3); font-size: 12px; margin-left: 4px; }
+.wx-field .tb { width: 100%; }
+.wx-field select { width: 100%; height: 32px; padding: 0 8px; border-radius: 4px; color: var(--text); background: var(--input);
+  border: 1px solid var(--ctl-stroke); border-bottom-color: var(--ctl-strong); font: inherit; outline: none; }
+.wx-field select:hover { background: var(--ctl-hover); }
+.wx-field select:focus { background: var(--input-focus); border-bottom-color: var(--accent); }
+.wx-field select option { background: var(--flyout); color: var(--text); }
+.wx-field .hint { font-size: 12px; line-height: 16px; color: var(--text-3); margin-top: 4px; }
+.wx-field .toggle { height: 32px; }
+.wx-ffoot { display: flex; align-items: center; gap: 8px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--divider); }
+.wx-fmsg { font-size: 12px; line-height: 16px; color: var(--text-3); min-width: 0; overflow-wrap: anywhere; }
+.wx-fmsg.bad { color: var(--bad); }
+.wx-ffoot .btn { min-width: 96px; }
+.wx-ffoot .ring { width: 14px; height: 14px; border-top-color: var(--on-accent); border-color: color-mix(in srgb, var(--on-accent) 30%, transparent); border-top-color: var(--on-accent); }
+
+@media (max-width: 760px) {
+  .wx-fields { grid-template-columns: minmax(0, 1fr); }
+  .wx-row { flex-direction: column; gap: 8px; }
+  .wx-acts { margin-left: -8px; }
+}

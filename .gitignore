@@ -32,6 +32,10 @@ Iris/Memories/People/
 Iris/Memories/Availability.md
 Iris/Pics/
 
+# Atlas's watches (per-user data, made on the first add) and the mail it already reported
+Atlas/watches.json
+Atlas/watch_seen.json
+
 # Iris texts queued for later (messages to real people)
 Iris/scheduled_texts*.json
 
@@ -52,3 +56,10 @@ Shared/setup.json
 Shared/setup-dryrun.*
 */CLAUDE.template.md
 App/app.lock
+Shared/setup-dryrun-preview/
+
+# Add-ons: last test results, weather alerts already sent, the voice notes speech model
+Shared/addons.json
+Shared/addons-dryrun.json
+Atlas/weather_alerts.json
+Models/

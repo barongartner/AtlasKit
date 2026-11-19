@@ -1,12 +1,12 @@
 # News
 
-What goes in the news section of the daily brief. The owner's city comes from setup. Atlas can change the beats here when the owner asks for more or less of something.
+What goes in the news section of the daily brief. {OWNER_NAME}'s city comes from setup. Atlas can change the beats here when {OWNER_NAME} asks for more or less of something.
 
 ## The beats, in this order
 
 One item per beat, two at most on a big day. Skip a beat if nothing real happened in the last 24 to 48 hours, but never skip the whole section.
 
-1. **Local** - the owner's city: roads, weather events, council decisions, transit, crime and safety that made the news, big events, the local teams when something actually happened.
+1. **Local** - {OWNER_NAME}'s city: roads, weather events, council decisions, transit, crime and safety that made the news, big events, the local teams when something actually happened.
 2. **Country** - the one or two national stories everyone will be talking about today, plus anything that changes what things cost.
 3. **World** - the biggest international story of the day.
 4. **Tech** - the biggest real tech story: major launches, AI models and tools, phones and apps they use. Not a niche research paper or a funding round.

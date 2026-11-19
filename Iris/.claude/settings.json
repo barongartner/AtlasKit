@@ -1,0 +1,6 @@
+{
+  "claudeMdExcludes": [
+    "C:/Users/*/.claude/CLAUDE.md"
+  ],
+  "autoMemoryEnabled": false
+}

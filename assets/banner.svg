@@ -1,0 +1,26 @@
+<svg width="1200" height="360" viewBox="0 0 1200 360" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Atlas - orchestrate • automate • always on">
+<defs>
+<linearGradient id="atlas-bg" x1="0" y1="0" x2="1200" y2="360" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="#13131a"/><stop offset="1" stop-color="#1c182c"/></linearGradient>
+<radialGradient id="atlas-glow" cx="219.5" cy="180.5" r="250" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="#0ea5e9" stop-opacity="0.20"/>
+<stop offset="1" stop-color="#0ea5e9" stop-opacity="0"/></radialGradient>
+<linearGradient id="atlas-icon" x1="126" y1="87" x2="313" y2="274" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="#38bdf8"/><stop offset="1" stop-color="#0369a1"/></linearGradient>
+<linearGradient id="atlas-sheen" x1="126" y1="87" x2="222" y2="213" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="#ffffff" stop-opacity="0.18"/><stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/></linearGradient>
+<filter id="atlas-ds" x="-40%" y="-40%" width="180%" height="180%" color-interpolation-filters="sRGB">
+<feDropShadow dx="0" dy="7" stdDeviation="11" flood-color="#000000" flood-opacity="0.33"/></filter>
+<linearGradient id="atlas-title" x1="371" y1="118" x2="371" y2="190" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#d7d7e2"/></linearGradient>
+</defs>
+<rect width="1200" height="360" fill="url(#atlas-bg)"/>
+<rect width="1200" height="360" fill="url(#atlas-glow)"/>
+<g stroke="#0ea5e9" stroke-width="4" opacity="0.10"><line x1="900" y1="120" x2="1010" y2="180"/><line x1="1010" y1="180" x2="956" y2="264"/><line x1="1010" y1="180" x2="1086" y2="128"/><line x1="1086" y1="128" x2="1146" y2="236"/><line x1="1010" y1="180" x2="1146" y2="236"/><line x1="900" y1="120" x2="1030" y2="74"/></g><g fill="#0ea5e9" opacity="0.16"><circle cx="900" cy="120" r="10"/><circle cx="1010" cy="180" r="10"/><circle cx="956" cy="264" r="10"/><circle cx="1086" cy="128" r="10"/><circle cx="1146" cy="236" r="10"/><circle cx="1030" cy="74" r="10"/></g>
+<rect x="126" y="87" width="187" height="187" rx="30" fill="url(#atlas-icon)" filter="url(#atlas-ds)"/>
+<rect x="126" y="87" width="187" height="187" rx="30" fill="url(#atlas-sheen)"/>
+<rect x="126.75" y="87.75" width="185.5" height="185.5" rx="29.25" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="1.5"/>
+<g transform="translate(219.5,180.5) scale(1.0872) translate(-150,-150)"><g stroke="#fff" stroke-width="6" stroke-linecap="round" opacity="0.85"><line x1="150" y1="150" x2="150" y2="106"/><line x1="150" y1="150" x2="196" y2="176"/><line x1="150" y1="150" x2="104" y2="176"/></g><circle cx="150" cy="150" r="17" fill="#fff"/><circle cx="150" cy="106" r="11" fill="#fff"/><circle cx="196" cy="176" r="11" fill="#fff"/><circle cx="104" cy="176" r="11" fill="#fff"/></g>
+<text x="371" y="187" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif" font-size="88" font-weight="800" letter-spacing="-1" fill="url(#atlas-title)">Atlas</text>
+<text x="366" y="248" font-family="'Segoe UI', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif" font-size="30" font-weight="500" fill="#8b8b9a">orchestrate • automate • always on</text>
+</svg>

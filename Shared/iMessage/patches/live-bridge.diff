@@ -1,0 +1,3231 @@
+diff --git a/pkg/connector/client.go b/pkg/connector/client.go
+index 62ab8f4..d33e07a 100644
+--- a/pkg/connector/client.go
++++ b/pkg/connector/client.go
+@@ -22,6 +22,7 @@ import (
+ 	"image/jpeg"
+ 	"math"
+ 	"net/url"
++	"os"
+ 	"path/filepath"
+ 	"regexp"
+ 	"runtime/debug"
+@@ -1468,6 +1469,7 @@ func (c *IMClient) Connect(ctx context.Context) {
+ 	c.msgBuffer = &messageBuffer{client: c}
+ 	go c.periodicStateSave(log)
+ 	go c.periodicPetRefresh(log)
++	go c.announceDeviceOnce(log)
+ 	go c.periodicStatusSharingReinvite(log)
+ 	go c.startSharedStreamsWatcher(log)
+ 
+@@ -1560,6 +1562,8 @@ func (c *IMClient) Connect(ctx context.Context) {
+ 		} else {
+ 			log.Warn().Msg("Local macOS contacts unavailable — contact names will not be resolved")
+ 		}
++	} else if icloudAuthPaused() {
++		log.Warn().Msg("iCloud auth paused (state/icloud-paused): skipping iCloud contacts")
+ 	} else {
+ 		cloudContacts := newCloudContactsClient(c.client, log)
+ 		if cloudContacts != nil {
+@@ -2682,7 +2686,11 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
+ 			if c.client == nil {
+ 				return
+ 			}
+-			if err := c.client.SendDeliveryReceipt(conv, c.getHandle()); err != nil {
++			receiptFrom := c.viaFromParticipants(msg.Participants)
++			if receiptFrom == "" {
++				receiptFrom = c.getHandle()
++			}
++			if err := c.client.SendDeliveryReceipt(conv, receiptFrom); err != nil {
+ 				log.Warn().Err(err).Msg("Failed to send delivery receipt")
+ 			}
+ 		}()
+@@ -3245,6 +3253,8 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
+ 			Msg("Portal creation decision for message")
+ 	}
+ 
++	via := c.viaFromParticipants(msg.Participants) // per-bot threads: see via_alias.go
++	setPortalVia(portalKey.ID, via)
+ 	hasText := msg.Text != nil && *msg.Text != "" && strings.TrimRight(*msg.Text, "\ufffc \n") != ""
+ 	if hasText {
+ 		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[*rustpushgo.WrappedMessage]{
+@@ -3260,7 +3270,10 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
+ 			},
+ 			Data:               &msg,
+ 			ID:                 makeMessageID(msg.Uuid),
+-			ConvertMessageFunc: convertMessage,
++			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *rustpushgo.WrappedMessage) (*bridgev2.ConvertedMessage, error) {
++				cm, err := convertMessage(ctx, portal, intent, data)
++				return tagVia(cm, via), err
++			},
+ 		})
+ 	}
+ 
+@@ -3307,7 +3320,8 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
+ 					*data.Attachment.MmcsDescriptorJson != "" {
+ 					c.enqueuePendingMMCSRecovery(ctx, portal, data)
+ 				}
+-				return convertAttachment(ctx, portal, intent, data, c.videoTranscoding(), c.heicConversion(), c.Main.Config.HEICJPEGQuality)
++				cm, err := convertAttachment(ctx, portal, intent, data, c.videoTranscoding(), c.heicConversion(), c.Main.Config.HEICJPEGQuality)
++				return tagVia(cm, via), err
+ 			},
+ 		})
+ 	}
+@@ -5659,7 +5673,13 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
+ 	}
+ 
+ 	// Priority 2: Auto-detect URL and fetch preview via homeserver or og: scraping
+-	if detectedURL := urlRegex.FindString(body); detectedURL != "" && isLikelyURL(detectedURL) {
++	// A real http(s) link beats the first dotted word ("code.xr", "czrc.ab.ca")
++	// that urlRegex would otherwise grab from the text before it (Atlas, 2026-11-02).
++	detectedURL := httpURLRegex.FindString(body)
++	if detectedURL == "" {
++		detectedURL = urlRegex.FindString(body)
++	}
++	if detectedURL != "" && isLikelyURL(detectedURL) {
+ 		fetchURL := normalizeURL(detectedURL)
+ 		log.Debug().Str("detected_url", detectedURL).Msg("Auto-detected URL in outbound message, fetching preview")
+ 		title, desc := "", ""
+@@ -5673,16 +5693,37 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
+ 				log.Debug().Err(err).Msg("Failed to fetch URL preview from homeserver for outbound")
+ 			}
+ 		}
+-		// Fall back to our own og: scraping if homeserver didn't provide metadata
++		// Our own og: scrape fills in what the homeserver didn't, and is the
++		// only source of the preview picture (the homeserver's is an mxc://
++		// thumbnail, not something we can put in the balloon).
++		ogData := fetchPageMetadata(ctx, fetchURL)
+ 		if title == "" && desc == "" {
+-			ogData := fetchPageMetadata(ctx, fetchURL)
+ 			title = ogData["title"]
+ 			desc = ogData["description"]
+ 			if title != "" || desc != "" {
+ 				log.Debug().Str("title", title).Str("description", desc).Msg("Got URL preview from og: scraping for outbound")
+ 			}
+ 		}
+-		return "\x00RL\x01" + detectedURL + "\x01" + fetchURL + "\x01" + title + "\x01" + desc + "\x00" + body
++		// Preview picture (richlink_image.go), like an iPhone sends: the page's
++		// big picture, or failing that its icon. Fields 5 to 9 of the
++		// envelope: temp file, picture URL, width, height, "image" or "icon".
++		// All empty when there's no picture; the Rust side then sends the
++		// title-only card as before.
++		imgPath, imgURL, imgW, imgH, imgKind := "", "", "", "", ""
++		img := prepareRichLinkImage(ctx, fetchURL, ogData["image"], false)
++		kind := "image"
++		if img == nil {
++			img = prepareRichLinkImage(ctx, fetchURL, ogData["icon"], true)
++			kind = "icon"
++		}
++		if img != nil {
++			imgPath, imgURL, imgKind = img.Path, img.URL, kind
++			imgW, imgH = strconv.Itoa(img.Width), strconv.Itoa(img.Height)
++		}
++		return "\x00RL\x01" + richLinkField(detectedURL) + "\x01" + richLinkField(fetchURL) +
++			"\x01" + richLinkField(title) + "\x01" + richLinkField(desc) +
++			"\x01" + imgPath + "\x01" + richLinkField(imgURL) + "\x01" + imgW + "\x01" + imgH +
++			"\x01" + imgKind + "\x00" + body
+ 	}
+ 
+ 	return body
+@@ -5712,6 +5753,7 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
+ 		return nil, bridgev2.ErrNotLoggedIn
+ 	}
+ 
++	c.applySendFrom(msg) // per-bot threads: see via_alias.go
+ 	conv := c.portalToConversation(msg.Portal)
+ 
+ 	// A stale carrier flag would route this into the SMS relay, where a bridge
+@@ -5754,6 +5796,11 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
+ 	}
+ 
+ 	textToSend := c.convertURLPreviewToIMessage(ctx, msg.Content)
++	// Bubble/screen effect (outbound_style.go): its own envelope in front of
++	// everything else, which the Rust side strips before the link envelope.
++	if fx := outboundEffect(msg); fx != "" {
++		textToSend = "\x00FX\x01" + fx + "\x00" + textToSend
++	}
+ 
+ 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
+ 	// Bodies large enough to need splitting do reach us: 45,000 bytes of content
+@@ -5764,7 +5811,13 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
+ 	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
+ 	// UUID (lib.rs:~7373). No Go-side retry here — a retry would generate a
+ 	// fresh MessageInst and orphan delivery receipts for the first attempt.
+-	uuid, err := c.client.SendMessage(conv, outbound[0], nil, c.getHandle(), replyGuid, replyPart, nil)
++	// Formatting only rides on a message that goes out in one piece: the
++	// HTML describes the whole text, not a chunk of it.
++	var outHTML *string
++	if len(outbound) == 1 {
++		outHTML = outboundHTML(msg.Content)
++	}
++	uuid, err := c.client.SendMessage(conv, outbound[0], outHTML, c.handleForPortal(msg.Portal.ID), replyGuid, replyPart, nil)
+ 	if err != nil {
+ 		// rustpush retried an unreachable iMessage as SMS and found no relay to
+ 		// carry it. Surface the same explanation as the pre-send guard rather than
+@@ -5787,6 +5840,16 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
+ 		}
+ 	}
+ 
++	// Notify Anyway (outbound_style.go): the urgent text breaks through the
++	// recipient's Focus, like tapping "Notify Anyway" on an iPhone.
++	if wantsNotifyAnyway(msg) {
++		if _, nerr := c.client.SendNotifyAnyways(conv, c.handleForPortal(msg.Portal.ID)); nerr != nil {
++			zerolog.Ctx(ctx).Warn().Err(nerr).Str("uuid", uuid).Msg("Notify Anyway failed; the message itself went out")
++		} else {
++			zerolog.Ctx(ctx).Info().Str("uuid", uuid).Msg("Sent Notify Anyway")
++		}
++	}
++
+ 	// Continuation chunks follow the first, once the primary UUID is persisted.
+ 	// The first UUID stays the bridge message ID so replies, echo dedup and
+ 	// unsends keep targeting one message; a failed continuation is logged rather
+@@ -5796,7 +5859,7 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
+ 	// message deleted while the tail stayed on the recipient's device.
+ 	var continuationUUIDs []string
+ 	for i, chunk := range outbound[1:] {
+-		contUUID, contErr := c.client.SendMessage(conv, chunk, nil, c.getHandle(), nil, nil, nil)
++		contUUID, contErr := c.client.SendMessage(conv, chunk, nil, c.handleForPortal(msg.Portal.ID), nil, nil, nil)
+ 		if contErr != nil {
+ 			zerolog.Ctx(ctx).Warn().Err(contErr).
+ 				Str("uuid", uuid).
+@@ -5851,7 +5914,7 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
+ 	return &bridgev2.MatrixMessageResponse{
+ 		DB: &database.Message{
+ 			ID:        makeMessageID(uuid),
+-			SenderID:  makeUserID(c.getHandle()),
++			SenderID:  makeUserID(c.handleForPortal(msg.Portal.ID)),
+ 			Timestamp: time.Now(),
+ 			Metadata:  &MessageMetadata{ContinuationUUIDs: continuationUUIDs},
+ 		},
+@@ -5979,8 +6042,10 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
+ 				mimeType = detected
+ 				fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".gif"
+ 			}
+-		} else if img, _, isJPEG := decodeImageData(data); img != nil {
+-			if !isJPEG {
++		} else if img, imgFormat, isJPEG := decodeImageData(data); img != nil {
++			// PNG stays PNG: an iPhone sends screenshots as PNG, and a
++			// re-encoded JPEG of one is a giveaway (Atlas, 2026-11-17).
++			if !isJPEG && imgFormat != "png" {
+ 				var buf bytes.Buffer
+ 				if encErr := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); encErr == nil {
+ 					data = buf.Bytes()
+@@ -5989,7 +6054,11 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
+ 				}
+ 			} else if detected := detectImageMIME(data); detected != "" && detected != mimeType {
+ 				mimeType = detected
+-				fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
++				ext := ".jpg"
++				if detected == "image/png" {
++					ext = ".png"
++				}
++				fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ext
+ 			}
+ 			// Edit the Matrix event with corrected image so other Beeper clients see it right
+ 			if mimeType != origMime {
+@@ -6020,7 +6089,17 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
+ 
+ 	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
+ 	// UUID — no Go-side retry here (would orphan delivery receipts).
+-	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.getHandle(), replyGuid, replyPart, nil)
++	// A bot's "com.atlas.stack" (stack.go) adds more photos to this one, sent
++	// as a single iMessage the way an iPhone stacks several pictures.
++	var uuid string
++	if extra := c.stackExtras(ctx, msg); len(extra) > 0 && !conv.IsSms {
++		files := append([]rustpushgo.WrappedOutboundFile{{
++			Data: data, Mime: mimeType, UtiType: mimeToUTI(mimeType), Filename: fileName,
++		}}, extra...)
++		uuid, err = c.client.SendAttachments(conv, files, c.handleForPortal(msg.Portal.ID), replyGuid, replyPart, nil)
++	} else {
++		uuid, err = c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handleForPortal(msg.Portal.ID), replyGuid, replyPart, nil)
++	}
+ 	if err != nil {
+ 		if errors.Is(err, rustpushgo.ErrWrappedErrorNoSmsRelay) {
+ 			return nil, errNoCarrierRoute
+@@ -6042,7 +6121,7 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
+ 	textMXID := id.EventID("")
+ 	siblingUUID := ""
+ 	if msg.Content.FileName != "" && msg.Content.Body != "" && msg.Content.Body != msg.Content.FileName {
+-		tUUID, textErr := c.client.SendMessage(conv, msg.Content.Body, nil, c.getHandle(), nil, nil, nil)
++		tUUID, textErr := c.client.SendMessage(conv, msg.Content.Body, nil, c.handleForPortal(msg.Portal.ID), nil, nil, nil)
+ 		if textErr != nil {
+ 			zerolog.Ctx(ctx).Warn().Err(textErr).Str("attachment_uuid", uuid).Msg("Failed to send caption as follow-up text; attachment was delivered")
+ 		} else {
+@@ -6094,7 +6173,7 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
+ 		bridgeRef := c.Main.Bridge
+ 		userLogin := c.UserLogin
+ 		portalKey := msg.Portal.PortalKey
+-		senderID := makeUserID(c.getHandle())
++		senderID := makeUserID(c.handleForPortal(msg.Portal.ID))
+ 		now := time.Now()
+ 		return &bridgev2.MatrixMessageResponse{
+ 			DB: &database.Message{
+@@ -6132,7 +6211,7 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
+ 	return &bridgev2.MatrixMessageResponse{
+ 		DB: &database.Message{
+ 			ID:        makeMessageID(finalUUID),
+-			SenderID:  makeUserID(c.getHandle()),
++			SenderID:  makeUserID(c.handleForPortal(msg.Portal.ID)),
+ 			Timestamp: time.Now(),
+ 			Metadata:  &MessageMetadata{HasAttachments: hasAttachments, SiblingUUID: siblingUUID},
+ 		},
+@@ -6148,7 +6227,7 @@ func (c *IMClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixT
+ 		return nil
+ 	}
+ 	return retrySendOnAPNsFlap(func() error {
+-		return c.client.SendTyping(conv, msg.IsTyping, c.getHandle())
++		return c.client.SendTyping(conv, msg.IsTyping, c.handleForPortal(msg.Portal.ID))
+ 	})
+ }
+ 
+@@ -6170,7 +6249,7 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
+ 		forUuid = &uuid
+ 	}
+ 	err := retrySendOnAPNsFlap(func() error {
+-		return c.client.SendReadReceipt(conv, c.getHandle(), forUuid)
++		return c.client.SendReadReceipt(conv, c.handleForPortal(receipt.Portal.ID), forUuid)
+ 	})
+ 	if err != nil {
+ 		errStr := err.Error()
+@@ -6223,7 +6302,7 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
+ 	}
+ 
+ 	// Rust-side retry handles SendTimedOut with stable UUID.
+-	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.getHandle())
++	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handleForPortal(msg.Portal.ID))
+ 	if err == nil {
+ 		// Work around mautrix-go bridgev2 not incrementing EditCount before saving.
+ 		msg.EditTarget.EditCount++
+@@ -6264,7 +6343,7 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
+ 
+ 	if siblingUUID != "" {
+ 		c.trackOutboundUnsend(siblingUUID)
+-		if _, sibErr := c.client.SendUnsend(conv, siblingUUID, 0, c.getHandle()); sibErr != nil {
++		if _, sibErr := c.client.SendUnsend(conv, siblingUUID, 0, c.handleForPortal(msg.Portal.ID)); sibErr != nil {
+ 			zerolog.Ctx(ctx).Warn().Err(sibErr).
+ 				Str("sibling_uuid", siblingUUID).
+ 				Msg("Failed to unsend sibling iMessage on split image+caption redact")
+@@ -6280,7 +6359,7 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
+ 	for i := len(continuationUUIDs) - 1; i >= 0; i-- {
+ 		contUUID := continuationUUIDs[i]
+ 		c.trackOutboundUnsend(contUUID)
+-		if _, contErr := c.client.SendUnsend(conv, contUUID, 0, c.getHandle()); contErr != nil {
++		if _, contErr := c.client.SendUnsend(conv, contUUID, 0, c.handleForPortal(msg.Portal.ID)); contErr != nil {
+ 			zerolog.Ctx(ctx).Warn().Err(contErr).
+ 				Str("continuation_uuid", contUUID).
+ 				Msg("Failed to unsend continuation chunk on redact of split message")
+@@ -6294,7 +6373,7 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
+ 	// Track outbound unsend so we can suppress the APNs echo.
+ 	c.trackOutboundUnsend(string(msg.TargetMessage.ID))
+ 	// Rust-side retry handles SendTimedOut with stable UUID.
+-	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.getHandle())
++	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handleForPortal(msg.Portal.ID))
+ 
+ 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
+ 	// while preserving the UUID for echo detection.
+@@ -6353,7 +6432,7 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
+ 			}
+ 		}
+ 		// Rust-side retry handles SendTimedOut with stable UUID.
+-		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.getHandle(), &targetGUID, nil, nil)
++		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handleForPortal(msg.Portal.ID), &targetGUID, nil, nil)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to send SMS reaction: %w", err)
+ 		}
+@@ -6367,14 +6446,14 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
+ 
+ 	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetMessage.ID))
+ 	// Rust-side retry handles SendTimedOut with stable UUID.
+-	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, false, c.getHandle())
++	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, false, c.handleForPortal(msg.Portal.ID))
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to send tapback: %w", err)
+ 	}
+ 
+ 	return &database.Reaction{
+ 		MessageID: msg.TargetMessage.ID,
+-		SenderID:  makeUserID(c.getHandle()),
++		SenderID:  makeUserID(c.handleForPortal(msg.Portal.ID)),
+ 		Emoji:     msg.Content.RelatesTo.Key,
+ 		Metadata:  &MessageMetadata{},
+ 		MXID:      msg.Event.ID,
+@@ -6403,7 +6482,7 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
+ 			}
+ 		}
+ 		// Rust-side retry handles SendTimedOut with stable UUID.
+-		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.getHandle(), &targetGUID, nil, nil)
++		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handleForPortal(msg.Portal.ID), &targetGUID, nil, nil)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -6413,7 +6492,7 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
+ 
+ 	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetReaction.MessageID))
+ 	// Rust-side retry handles SendTimedOut with stable UUID.
+-	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, true, c.getHandle())
++	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, true, c.handleForPortal(msg.Portal.ID))
+ 	return err
+ }
+ 
+@@ -8781,6 +8860,9 @@ func (c *IMClient) safeRefreshPetTokenThrottled() error {
+ // restart loops. This raw variant is appropriate only for self-throttled
+ // paths like the 12h periodic refresh.
+ func safeRefreshPetToken(tp *rustpushgo.WrappedTokenProvider) error {
++	if icloudAuthPaused() { // crew patch: this is an Apple password login
++		return fmt.Errorf("iCloud auth paused")
++	}
+ 	done := make(chan error, 1)
+ 	go func() {
+ 		defer func() {
+@@ -8855,6 +8937,9 @@ func (c *IMClient) periodicStatusSharingReinvite(log zerolog.Logger) {
+ // on success, so a throttled account eases off instead of compounding the
+ // rate limit. Applies to both iCloud and external CardDAV sources.
+ func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
++	if icloudAuthPaused() {
++		return
++	}
+ 	schedule := newContactSyncSchedule(15*time.Minute, 6*time.Hour)
+ 	timer := time.NewTimer(schedule.next())
+ 	defer timer.Stop()
+@@ -10200,7 +10285,7 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
+ 	// For self-chats, only include one participant. Duplicating our own
+ 	// handle (e.g. [self, self]) causes rustpush to reject the message
+ 	// with NoValidTargets because all targets belong to the sender.
+-	participants := []string{c.getHandle(), sendTo}
++	participants := []string{c.handleForPortal(portal.ID), sendTo}
+ 	if c.isMyHandle(sendTo) {
+ 		participants = []string{sendTo}
+ 	}
+@@ -11525,6 +11610,8 @@ func (c *IMClient) wasOutboundUnsend(uuid string) bool {
+ 
+ // urlRegex matches URLs in message text for rich link matching.
+ // Matches explicit schemes (https://...) and bare domains (example.com, example.com/path).
++var httpURLRegex = regexp.MustCompile(`https?://[^\s<>]+[^\s<>().,;:!?'"]`)
++
+ var urlRegex = regexp.MustCompile(`(?:https?://\S+|(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}(?:/\S*)?)`)
+ 
+ // isLikelyURL validates that a regex-matched string is actually a URL and not
+@@ -11937,3 +12024,38 @@ func (c *IMClient) persistGroupParticipantsIfChanged(portalID string, participan
+ 		}
+ 	}(portalID, normalized)
+ }
++
++// icloudAuthPaused stops the background iCloud jobs (contacts, shared-profile
++// fetch) while ~/imessage-bridge/state/icloud-paused exists. Each of them runs
++// an Apple password login when its token is stale, and dozens a day got the
++// account locked (2026-10-24). Delete the file to turn them back on.
++func icloudAuthPaused() bool {
++	_, err := os.Stat(os.ExpandEnv("$HOME/imessage-bridge/state/icloud-paused"))
++	return err == nil
++}
++
++// announceDeviceOnce runs the device announce OB does at login (see
++// AnnounceAppleDeviceIfNeeded), which nothing here ever called. It declares this
++// endpoint for iCloud, iMessage and FaceTime, and might be what opens FaceTime
++// key lookups for the account. Once per state/announced, never while paused.
++func (c *IMClient) announceDeviceOnce(log zerolog.Logger) {
++	marker := os.ExpandEnv("$HOME/imessage-bridge/state/announced")
++	select {
++	case <-c.stopChan:
++		return
++	case <-time.After(90 * time.Second):
++	}
++	if _, err := os.Stat(marker); err == nil || icloudAuthPaused() {
++		return
++	}
++	if c.tokenProvider == nil || *c.tokenProvider == nil {
++		return
++	}
++	if err := (*c.tokenProvider).AnnounceAppleDeviceIfNeeded(); err != nil {
++		log.Warn().Err(err).Msg("Device announce failed")
++		return
++	}
++	log.Info().Msg("Device announce done")
++	_ = os.WriteFile(marker, []byte("done"), 0o644)
++	c.persistAccountState(log)
++}
+diff --git a/pkg/connector/commands.go b/pkg/connector/commands.go
+index 819f4fd..eb20f6b 100644
+--- a/pkg/connector/commands.go
++++ b/pkg/connector/commands.go
+@@ -65,6 +65,8 @@ func BridgeCommands() []*commands.FullHandler {
+ 		cmdResolveIdentifierRedirect,
+ 		cmdListIdentities,
+ 		cmdSetIdentity,
++		cmdShareProfile,
++		cmdSendProfile,
+ 		cmdRestoreChat,
+ 		cmdRestoreDebug,
+ 		cmdMsgDebug,
+diff --git a/pkg/connector/facetime.go b/pkg/connector/facetime.go
+index d3d5ed5..bffd9e7 100644
+--- a/pkg/connector/facetime.go
++++ b/pkg/connector/facetime.go
+@@ -18,6 +18,7 @@ package connector
+ 
+ import (
+ 	"context"
++	"regexp"
+ 	"strings"
+ 
+ 	"github.com/rs/zerolog"
+@@ -41,6 +42,39 @@ const (
+ 	faceTimeMissedMarker = "[[FACETIME_MISSED]]"
+ )
+ 
++// Crew patch 2026-10-20 (crew FaceTime): Rust appends " via=<handle>" (which
++// of our addresses was called) to every call notice, and " link=<url>" to a
++// ring on a handle in FACETIME_ANSWER_HANDLES (see facetime_notify.rs). The
++// notice carries them as extra fields so the bot that owns that address
++// answers its own calls (opening the link) and its own missed calls; the
++// call's guid rides along too.
++const (
++	faceTimeLinkKey = "com.atlas.facetime_link"
++	faceTimeGuidKey = "com.atlas.facetime_guid"
++)
++
++var (
++	faceTimeViaRe  = regexp.MustCompile(`\bvia=(\S+)`)
++	faceTimeLinkRe = regexp.MustCompile(`\blink=(https://facetime\.apple\.com/join#\S+)`)
++	faceTimeGuidRe = regexp.MustCompile(`\bguid=(\S+)`)
++)
++
++// faceTimeNoticeExtra is the extra event content for a notice built from
++// Rust's text: guid and via always, link when Rust minted an answer link.
++func faceTimeNoticeExtra(text string) map[string]any {
++	extra := map[string]any{}
++	if m := faceTimeGuidRe.FindStringSubmatch(text); m != nil {
++		extra[faceTimeGuidKey] = m[1]
++	}
++	if m := faceTimeViaRe.FindStringSubmatch(text); m != nil {
++		extra[viaExtraKey] = m[1]
++	}
++	if m := faceTimeLinkRe.FindStringSubmatch(text); m != nil {
++		extra[faceTimeLinkKey] = m[1]
++	}
++	return extra
++}
++
+ // faceTimeNoticeKind is which call outcome a notice reports.
+ type faceTimeNoticeKind int
+ 
+@@ -105,6 +139,7 @@ func (c *IMClient) postFaceTimeNotice(log zerolog.Logger, msg rustpushgo.Wrapped
+ 	senderHandle := ptrStringOr(msg.Sender, "")
+ 	label := kind.logLabel()
+ 	markdown := faceTimeNoticeMarkdown(kind, c.faceTimeCallerName(ctx, senderHandle))
++	extra := faceTimeNoticeExtra(ptrStringOr(msg.Text, ""))
+ 
+ 	sendNotice := func(roomID id.RoomID) error {
+ 		content := format.RenderMarkdown(markdown, true, false)
+@@ -112,6 +147,7 @@ func (c *IMClient) postFaceTimeNotice(log zerolog.Logger, msg rustpushgo.Wrapped
+ 		content.Mentions = &event.Mentions{}
+ 		_, err := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
+ 			Parsed: &content,
++			Raw:    extra,
+ 		}, nil)
+ 		return err
+ 	}
+diff --git a/pkg/connector/shared_profile.go b/pkg/connector/shared_profile.go
+index 8d336b2..4fc864b 100644
+--- a/pkg/connector/shared_profile.go
++++ b/pkg/connector/shared_profile.go
+@@ -381,7 +381,7 @@ func (c *IMClient) applyCachedSharedProfilesToGhosts(log zerolog.Logger) {
+ // handleSharedProfile path and bypass this throttle, so profile changes
+ // the peer iPhone announces are still applied immediately.
+ func (c *IMClient) refreshAllSharedProfiles(log zerolog.Logger) {
+-	if c.sharedProfileStore == nil || c.client == nil {
++	if c.sharedProfileStore == nil || c.client == nil || icloudAuthPaused() {
+ 		return
+ 	}
+ 	rows, err := c.sharedProfileStore.loadAll(context.Background())
+diff --git a/pkg/connector/sharedstreams.go b/pkg/connector/sharedstreams.go
+index 8256a24..a224235 100644
+--- a/pkg/connector/sharedstreams.go
++++ b/pkg/connector/sharedstreams.go
+@@ -886,7 +886,9 @@ func (c *IMClient) pollSharedStreams(log zerolog.Logger) (retErr error) {
+ 		}
+ 	}()
+ 
+-	if c.client == nil {
++	// Crew patch: every poll with a stale token runs an Apple password login,
++	// every 10 minutes, the same hammering that locked the account (2026-10-24).
++	if c.client == nil || icloudAuthPaused() {
+ 		return nil
+ 	}
+ 
+diff --git a/pkg/connector/urlpreview.go b/pkg/connector/urlpreview.go
+index a26dc83..110d43c 100644
+--- a/pkg/connector/urlpreview.go
++++ b/pkg/connector/urlpreview.go
+@@ -335,6 +335,32 @@ func fetchPageMetadataWithUA(ctx context.Context, targetURL string, ua string) m
+ 		result["image:secure_url"] = ogTags["image:secure_url"]
+ 	}
+ 
++	// The site's icon, for a card with no big picture: an iPhone shows it
++	// small beside the title. apple-touch-icon is the big square one sites
++	// make for exactly this; a plain favicon is the last resort.
++	icons := map[string]string{}
++	for _, m := range linkTagRegex.FindAllString(htmlStr, -1) {
++		rel := strings.ToLower(attrValue(m, "rel"))
++		href := html.UnescapeString(attrValue(m, "href"))
++		if href == "" {
++			continue
++		}
++		for _, r := range strings.Fields(rel) {
++			if (r == "apple-touch-icon" || r == "apple-touch-icon-precomposed" || r == "icon") && icons[r] == "" {
++				icons[r] = href
++			}
++		}
++	}
++	for _, r := range []string{"apple-touch-icon", "apple-touch-icon-precomposed", "icon"} {
++		if icons[r] != "" {
++			result["icon"] = icons[r]
++			break
++		}
++	}
++	if result["icon"] == "" {
++		result["icon"] = "/apple-touch-icon.png"
++	}
++
+ 	// Fall back to <title> tag if no title was found from any meta tags
+ 	if result["title"] == "" {
+ 		if m := titleRegex.FindStringSubmatch(htmlStr); m != nil {
+@@ -383,3 +409,16 @@ func downloadURL(ctx context.Context, targetURL string) ([]byte, string, error)
+ 
+ 	return data, mime, nil
+ }
++
++// linkTagRegex matches every <link ...> tag; attrValue reads one attribute
++// out of it, quoted either way or not at all.
++var linkTagRegex = regexp.MustCompile(`(?is)<link\s[^>]*>`)
++
++func attrValue(tag, name string) string {
++	re := regexp.MustCompile(`(?is)\s` + regexp.QuoteMeta(name) + `\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))`)
++	m := re.FindStringSubmatch(tag)
++	if m == nil {
++		return ""
++	}
++	return strings.TrimSpace(m[1] + m[2] + m[3])
++}
+diff --git a/pkg/rustpushgo/Cargo.lock b/pkg/rustpushgo/Cargo.lock
+index 669e38f..076b7a6 100644
+--- a/pkg/rustpushgo/Cargo.lock
++++ b/pkg/rustpushgo/Cargo.lock
+@@ -1157,6 +1157,15 @@ version = "2.3.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
+ 
++[[package]]
++name = "fdk-aac-sys"
++version = "0.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "24516d2611506d5cb1833555adc75f6baf9fe2706b9c13e6fc33a6b22c51ca83"
++dependencies = [
++ "cc",
++]
++
+ [[package]]
+ name = "ff"
+ version = "0.13.1"
+@@ -3611,6 +3620,7 @@ dependencies = [
+  "chrono",
+  "cloudkit-proto",
+  "ctr",
++ "fdk-aac-sys",
+  "futures",
+  "futures-util",
+  "hex",
+diff --git a/pkg/rustpushgo/Cargo.toml b/pkg/rustpushgo/Cargo.toml
+index 6cb4f57..78623dc 100644
+--- a/pkg/rustpushgo/Cargo.toml
++++ b/pkg/rustpushgo/Cargo.toml
+@@ -21,6 +21,7 @@ hardware-key = ["rustpush/macos-validation-data"]
+ rustpush-avid-download = []
+ 
+ [dependencies]
++fdk-aac-sys = "0.5"
+ tokio = { version = "1", features = ["full"] }
+ futures = "0.3"
+ uniffi = { version = "0.25.0", features = ["tokio"] }
+diff --git a/pkg/rustpushgo/rustpushgo.go b/pkg/rustpushgo/rustpushgo.go
+index f91f510..27ba619 100644
+--- a/pkg/rustpushgo/rustpushgo.go
++++ b/pkg/rustpushgo/rustpushgo.go
+@@ -762,6 +762,15 @@ func uniffiCheckChecksums() {
+ 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_list_recoverable_message_guids: UniFFI API checksum mismatch")
+ 		}
+ 	}
++	{
++		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
++			return C.uniffi_rustpushgo_checksum_method_client_publish_profile(uniffiStatus)
++		})
++		if checksum != 25122 {
++			// If this happens try cleaning and rebuilding your project
++			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_publish_profile: UniFFI API checksum mismatch")
++		}
++	}
+ 	{
+ 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+ 			return C.uniffi_rustpushgo_checksum_method_client_purge_recoverable_zones(uniffiStatus)
+@@ -843,6 +852,15 @@ func uniffiCheckChecksums() {
+ 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_send_attachment: UniFFI API checksum mismatch")
+ 		}
+ 	}
++	{
++		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
++			return C.uniffi_rustpushgo_checksum_method_client_send_attachments(uniffiStatus)
++		})
++		if checksum != 37396 {
++			// If this happens try cleaning and rebuilding your project
++			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_send_attachments: UniFFI API checksum mismatch")
++		}
++	}
+ 	{
+ 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+ 			return C.uniffi_rustpushgo_checksum_method_client_send_change_participants(uniffiStatus)
+@@ -969,6 +987,15 @@ func uniffiCheckChecksums() {
+ 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_send_permanent_delete_messages: UniFFI API checksum mismatch")
+ 		}
+ 	}
++	{
++		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
++			return C.uniffi_rustpushgo_checksum_method_client_send_profile_share(uniffiStatus)
++		})
++		if checksum != 57345 {
++			// If this happens try cleaning and rebuilding your project
++			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_send_profile_share: UniFFI API checksum mismatch")
++		}
++	}
+ 	{
+ 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+ 			return C.uniffi_rustpushgo_checksum_method_client_send_read_receipt(uniffiStatus)
+@@ -2866,6 +2893,31 @@ func (_self *Client) ListRecoverableMessageGuids() ([]string, error) {
+ 		})
+ }
+ 
++func (_self *Client) PublishProfile(displayName string, firstName string, lastName string, image *[]byte) error {
++	_pointer := _self.ffiObject.incrementPointer("*Client")
++	defer _self.ffiObject.decrementPointer()
++	return uniffiRustCallAsyncWithError(
++		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
++			// rustFutureFunc
++			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_publish_profile(
++				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(displayName)), rustBufferToC(FfiConverterStringINSTANCE.Lower(firstName)), rustBufferToC(FfiConverterStringINSTANCE.Lower(lastName)), rustBufferToC(FfiConverterOptionalBytesINSTANCE.Lower(image)),
++				status,
++			))
++		},
++		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
++			// pollFunc
++			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
++		},
++		func(handle *C.void, status *C.RustCallStatus) {
++			// completeFunc
++			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
++		},
++		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
++			// freeFunc
++			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
++		})
++}
++
+ func (_self *Client) PurgeRecoverableZones() error {
+ 	_pointer := _self.ffiObject.incrementPointer("*Client")
+ 	defer _self.ffiObject.decrementPointer()
+@@ -3073,6 +3125,31 @@ func (_self *Client) SendAttachment(conversation WrappedConversation, data []byt
+ 		})
+ }
+ 
++func (_self *Client) SendAttachments(conversation WrappedConversation, files []WrappedOutboundFile, handle string, replyGuid *string, replyPart *string, body *string) (string, error) {
++	_pointer := _self.ffiObject.incrementPointer("*Client")
++	defer _self.ffiObject.decrementPointer()
++	return uniffiRustCallAsyncWithErrorAndResult(
++		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
++			// rustFutureFunc
++			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_attachments(
++				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterSequenceTypeWrappedOutboundFileINSTANCE.Lower(files)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(replyGuid)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(replyPart)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(body)),
++				status,
++			))
++		},
++		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
++			// pollFunc
++			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
++		},
++		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
++			// completeFunc
++			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
++		},
++		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
++			// freeFunc
++			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
++		})
++}
++
+ func (_self *Client) SendChangeParticipants(conversation WrappedConversation, newParticipants []string, groupVersion uint64, handle string) (string, error) {
+ 	_pointer := _self.ffiObject.incrementPointer("*Client")
+ 	defer _self.ffiObject.decrementPointer()
+@@ -3423,6 +3500,31 @@ func (_self *Client) SendPermanentDeleteMessages(conversation WrappedConversatio
+ 		})
+ }
+ 
++func (_self *Client) SendProfileShare(conversation WrappedConversation, handle string) error {
++	_pointer := _self.ffiObject.incrementPointer("*Client")
++	defer _self.ffiObject.decrementPointer()
++	return uniffiRustCallAsyncWithError(
++		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
++			// rustFutureFunc
++			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_profile_share(
++				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
++				status,
++			))
++		},
++		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
++			// pollFunc
++			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
++		},
++		func(handle *C.void, status *C.RustCallStatus) {
++			// completeFunc
++			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
++		},
++		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
++			// freeFunc
++			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
++		})
++}
++
+ func (_self *Client) SendReadReceipt(conversation WrappedConversation, handle string, forUuid *string) error {
+ 	_pointer := _self.ffiObject.incrementPointer("*Client")
+ 	defer _self.ffiObject.decrementPointer()
+@@ -7033,6 +7135,54 @@ func (_ FfiDestroyerTypeWrappedMessage) Destroy(value WrappedMessage) {
+ 	value.Destroy()
+ }
+ 
++type WrappedOutboundFile struct {
++	Data     []byte
++	Mime     string
++	UtiType  string
++	Filename string
++}
++
++func (r *WrappedOutboundFile) Destroy() {
++	FfiDestroyerBytes{}.Destroy(r.Data)
++	FfiDestroyerString{}.Destroy(r.Mime)
++	FfiDestroyerString{}.Destroy(r.UtiType)
++	FfiDestroyerString{}.Destroy(r.Filename)
++}
++
++type FfiConverterTypeWrappedOutboundFile struct{}
++
++var FfiConverterTypeWrappedOutboundFileINSTANCE = FfiConverterTypeWrappedOutboundFile{}
++
++func (c FfiConverterTypeWrappedOutboundFile) Lift(rb RustBufferI) WrappedOutboundFile {
++	return LiftFromRustBuffer[WrappedOutboundFile](c, rb)
++}
++
++func (c FfiConverterTypeWrappedOutboundFile) Read(reader io.Reader) WrappedOutboundFile {
++	return WrappedOutboundFile{
++		FfiConverterBytesINSTANCE.Read(reader),
++		FfiConverterStringINSTANCE.Read(reader),
++		FfiConverterStringINSTANCE.Read(reader),
++		FfiConverterStringINSTANCE.Read(reader),
++	}
++}
++
++func (c FfiConverterTypeWrappedOutboundFile) Lower(value WrappedOutboundFile) RustBuffer {
++	return LowerIntoRustBuffer[WrappedOutboundFile](c, value)
++}
++
++func (c FfiConverterTypeWrappedOutboundFile) Write(writer io.Writer, value WrappedOutboundFile) {
++	FfiConverterBytesINSTANCE.Write(writer, value.Data)
++	FfiConverterStringINSTANCE.Write(writer, value.Mime)
++	FfiConverterStringINSTANCE.Write(writer, value.UtiType)
++	FfiConverterStringINSTANCE.Write(writer, value.Filename)
++}
++
++type FfiDestroyerTypeWrappedOutboundFile struct{}
++
++func (_ FfiDestroyerTypeWrappedOutboundFile) Destroy(value WrappedOutboundFile) {
++	value.Destroy()
++}
++
+ type WrappedPasswordEntryRef struct {
+ 	Id    string
+ 	Group *string
+@@ -8619,6 +8769,49 @@ func (FfiDestroyerSequenceTypeWrappedCloudSyncMessage) Destroy(sequence []Wrappe
+ 	}
+ }
+ 
++type FfiConverterSequenceTypeWrappedOutboundFile struct{}
++
++var FfiConverterSequenceTypeWrappedOutboundFileINSTANCE = FfiConverterSequenceTypeWrappedOutboundFile{}
++
++func (c FfiConverterSequenceTypeWrappedOutboundFile) Lift(rb RustBufferI) []WrappedOutboundFile {
++	return LiftFromRustBuffer[[]WrappedOutboundFile](c, rb)
++}
++
++func (c FfiConverterSequenceTypeWrappedOutboundFile) Read(reader io.Reader) []WrappedOutboundFile {
++	length := readInt32(reader)
++	if length == 0 {
++		return nil
++	}
++	result := make([]WrappedOutboundFile, 0, length)
++	for i := int32(0); i < length; i++ {
++		result = append(result, FfiConverterTypeWrappedOutboundFileINSTANCE.Read(reader))
++	}
++	return result
++}
++
++func (c FfiConverterSequenceTypeWrappedOutboundFile) Lower(value []WrappedOutboundFile) RustBuffer {
++	return LowerIntoRustBuffer[[]WrappedOutboundFile](c, value)
++}
++
++func (c FfiConverterSequenceTypeWrappedOutboundFile) Write(writer io.Writer, value []WrappedOutboundFile) {
++	if len(value) > math.MaxInt32 {
++		panic("[]WrappedOutboundFile is too large to fit into Int32")
++	}
++
++	writeInt32(writer, int32(len(value)))
++	for _, item := range value {
++		FfiConverterTypeWrappedOutboundFileINSTANCE.Write(writer, item)
++	}
++}
++
++type FfiDestroyerSequenceTypeWrappedOutboundFile struct{}
++
++func (FfiDestroyerSequenceTypeWrappedOutboundFile) Destroy(sequence []WrappedOutboundFile) {
++	for _, value := range sequence {
++		FfiDestroyerTypeWrappedOutboundFile{}.Destroy(value)
++	}
++}
++
+ type FfiConverterSequenceTypeWrappedPasswordEntryRef struct{}
+ 
+ var FfiConverterSequenceTypeWrappedPasswordEntryRefINSTANCE = FfiConverterSequenceTypeWrappedPasswordEntryRef{}
+diff --git a/pkg/rustpushgo/rustpushgo.h b/pkg/rustpushgo/rustpushgo.h
+index e1d1a69..97be82d 100644
+--- a/pkg/rustpushgo/rustpushgo.h
++++ b/pkg/rustpushgo/rustpushgo.h
+@@ -257,6 +257,15 @@ void* uniffi_rustpushgo_fn_method_client_list_recoverable_message_guids(
+ 	RustCallStatus* out_status
+ );
+ 
++void* uniffi_rustpushgo_fn_method_client_publish_profile(
++	void* ptr,
++	RustBuffer display_name,
++	RustBuffer first_name,
++	RustBuffer last_name,
++	RustBuffer image,
++	RustCallStatus* out_status
++);
++
+ void* uniffi_rustpushgo_fn_method_client_purge_recoverable_zones(
+ 	void* ptr,
+ 	RustCallStatus* out_status
+@@ -324,6 +333,17 @@ void* uniffi_rustpushgo_fn_method_client_send_attachment(
+ 	RustCallStatus* out_status
+ );
+ 
++void* uniffi_rustpushgo_fn_method_client_send_attachments(
++	void* ptr,
++	RustBuffer conversation,
++	RustBuffer files,
++	RustBuffer handle,
++	RustBuffer reply_guid,
++	RustBuffer reply_part,
++	RustBuffer body,
++	RustCallStatus* out_status
++);
++
+ void* uniffi_rustpushgo_fn_method_client_send_change_participants(
+ 	void* ptr,
+ 	RustBuffer conversation,
+@@ -443,6 +463,13 @@ void* uniffi_rustpushgo_fn_method_client_send_permanent_delete_messages(
+ 	RustCallStatus* out_status
+ );
+ 
++void* uniffi_rustpushgo_fn_method_client_send_profile_share(
++	void* ptr,
++	RustBuffer conversation,
++	RustBuffer handle,
++	RustCallStatus* out_status
++);
++
+ void* uniffi_rustpushgo_fn_method_client_send_read_receipt(
+ 	void* ptr,
+ 	RustBuffer conversation,
+@@ -1586,6 +1613,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_list_recoverable_message_guids
+ 	RustCallStatus* out_status
+ );
+ 
++uint16_t uniffi_rustpushgo_checksum_method_client_publish_profile(
++	RustCallStatus* out_status
++);
++
+ uint16_t uniffi_rustpushgo_checksum_method_client_purge_recoverable_zones(
+ 	RustCallStatus* out_status
+ );
+@@ -1622,6 +1653,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_attachment(
+ 	RustCallStatus* out_status
+ );
+ 
++uint16_t uniffi_rustpushgo_checksum_method_client_send_attachments(
++	RustCallStatus* out_status
++);
++
+ uint16_t uniffi_rustpushgo_checksum_method_client_send_change_participants(
+ 	RustCallStatus* out_status
+ );
+@@ -1678,6 +1713,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_permanent_delete_messages
+ 	RustCallStatus* out_status
+ );
+ 
++uint16_t uniffi_rustpushgo_checksum_method_client_send_profile_share(
++	RustCallStatus* out_status
++);
++
+ uint16_t uniffi_rustpushgo_checksum_method_client_send_read_receipt(
+ 	RustCallStatus* out_status
+ );
+diff --git a/pkg/rustpushgo/src/facetime_notify.rs b/pkg/rustpushgo/src/facetime_notify.rs
+index a2b1b1a..7ba56eb 100644
+--- a/pkg/rustpushgo/src/facetime_notify.rs
++++ b/pkg/rustpushgo/src/facetime_notify.rs
+@@ -134,10 +134,13 @@ pub(crate) fn notice_for_event(
+ ///
+ /// `ringing_before` is the snapshot taken before `handle()` ran, and is what
+ /// distinguishes that mid-ring hang-up from someone leaving a finished call.
++/// `answer` (crew patch) is the called handle and its answer link, from
++/// `answer_link_for_ring`; a ring notice carries both.
+ pub(crate) async fn facetime_event_to_wrapped(
+     facetime: &rustpush::facetime::FTClient,
+     event: &rustpush::facetime::FTMessage,
+     ringing_before: &std::collections::HashMap<String, SessionBefore>,
++    answer: Option<(String, String)>,
+ ) -> Option<WrappedMessage> {
+     let guid = event_guid(event)?;
+ 
+@@ -148,7 +151,7 @@ pub(crate) async fn facetime_event_to_wrapped(
+     // them — the way the pre-9a version of this function already read it.
+     let state = facetime.state.read().await;
+     let session = state.sessions.get(guid);
+-    let (missed_after, participants, my_handles) = session
++    let (missed_after, participants, my_handles, called) = session
+         .map(|session| {
+             let participants = session
+                 .members
+@@ -162,9 +165,11 @@ pub(crate) async fn facetime_event_to_wrapped(
+                 matches!(session.mode, Some(rustpush::facetime::FTMode::Missed)),
+                 participants,
+                 my_handles,
++                // crew patch: which of our addresses the call is to
++                session.my_handles.first().cloned(),
+             )
+         })
+-        .unwrap_or_else(|| (false, Vec::new(), std::collections::HashSet::new()));
++        .unwrap_or_else(|| (false, Vec::new(), std::collections::HashSet::new(), None));
+     drop(state);
+ 
+     let (marker, mut sender) =
+@@ -190,7 +195,17 @@ pub(crate) async fn facetime_event_to_wrapped(
+     let mut wrapped = WrappedMessage::default();
+     wrapped.uuid = format!("FACETIME_{}_{}_{}", event_kind.to_uppercase(), guid, now_ms);
+     wrapped.sender = sender;
+-    wrapped.text = Some(format!("{marker} guid={guid}"));
++    // Crew patch: every notice says which of our addresses was called (each
++    // bot answers its own calls); a ring on an answer handle adds the link.
++    let mut text = format!("{marker} guid={guid}");
++    let answer = answer.filter(|_| marker == FACETIME_RING_MARKER);
++    if let Some(via) = answer.as_ref().map(|(via, _)| via.clone()).or(called) {
++        text.push_str(&format!(" via={via}"));
++    }
++    if let Some((_, link)) = answer {
++        text.push_str(&format!(" link={link}"));
++    }
++    wrapped.text = Some(text);
+     wrapped.participants = participants;
+     wrapped.timestamp_ms = now_ms;
+     wrapped.is_notify_anyways = true;
+@@ -272,6 +287,406 @@ fn backfill_facetime_creation_time(raw: &mut plist::Value, now_ms: u64) -> usize
+     migrated
+ }
+ 
++// ---------------------------------------------------------------------------
++// Crew patch 2026-10-20: answering FaceTime calls (Atlas).
++//
++// The handles in FACETIME_ANSWER_HANDLES (comma list, set in start.sh) get
++// their rings answered by a web client instead of just a notice:
++//
++//   1. A ring on one of those handles binds that handle's own bridge-owned
++//      link ("answer:<handle>", minted once, lives a year) to the ringing
++//      session, and the ring notice carries the link (`via=... link=...`).
++//   2. The bot opens the link in Chrome. The web page sends a LetMeIn to the
++//      link's pseudonym, which is this bridge.
++//   3. A LetMeIn for a bound link is approved into that session:
++//      respond_letmein props the call (rustpush's join(), signaling only
++//      because this bridge never sets local interfaces) and adds the web
++//      client, which then joins and carries the audio. rustpush unprops when
++//      the web client's join arrives.
++//
++// A bind is used once and expires after ANSWER_WINDOW, and only links this
++// bridge minted for a ring can be bound, so a LetMeIn anywhere else is left
++// alone. The link itself only ever goes to the local Matrix room.
++
++const ANSWER_USAGE_PREFIX: &str = "answer:";
++const ANSWER_WINDOW: std::time::Duration = std::time::Duration::from_secs(90);
++
++/// (answer link pseudonym, ringing session guid, when it was bound)
++static ANSWER_BINDS: std::sync::Mutex<Vec<(String, String, std::time::Instant)>> =
++    std::sync::Mutex::new(Vec::new());
++
++fn answer_handles() -> Vec<String> {
++    std::env::var("FACETIME_ANSWER_HANDLES")
++        .unwrap_or_default()
++        .split(',')
++        .map(|h| h.trim().to_lowercase())
++        .filter(|h| !h.is_empty())
++        .collect()
++}
++
++/// The session guid of an event that means someone is calling us.
++fn ring_guid(event: &rustpush::facetime::FTMessage) -> Option<&str> {
++    use rustpush::facetime::FTMessage;
++    match event {
++        FTMessage::Ring { guid } => Some(guid),
++        FTMessage::JoinEvent { guid, ring: true, .. } => Some(guid),
++        FTMessage::AddMembers { guid, ring: true, .. } => Some(guid),
++        _ => None,
++    }
++}
++
++/// Get (or mint) the answer link for a handle. Bounded and panic-guarded:
++/// minting talks to Apple and validate_pseudonym panics on a missing cache.
++async fn answer_link(facetime: &rustpush::facetime::FTClient, handle: &str) -> Option<String> {
++    let usage = format!("{ANSWER_USAGE_PREFIX}{handle}");
++    let minted = tokio::time::timeout(
++        std::time::Duration::from_secs(15),
++        crate::panic_guard::guard_panic("FaceTime answer link", facetime.get_link_for_usage(handle, &usage)),
++    )
++    .await;
++    match minted {
++        Ok(Some(Ok(link))) => Some(link),
++        Ok(Some(Err(e))) => {
++            warn!("FaceTime answer: couldn't get a link for {handle}: {e:?}");
++            None
++        }
++        Ok(None) => None, // panicked, the guard logged it
++        Err(_) => {
++            warn!("FaceTime answer: getting a link for {handle} timed out");
++            None
++        }
++    }
++}
++
++/// For a ring on an answer handle: bind that handle's link to the ringing
++/// session and return (called handle, link) for the ring notice.
++pub(crate) async fn answer_link_for_ring(
++    facetime: &rustpush::facetime::FTClient,
++    event: &rustpush::facetime::FTMessage,
++) -> Option<(String, String)> {
++    let guid = ring_guid(event)?.to_string();
++    let wanted = answer_handles();
++    if wanted.is_empty() {
++        return None;
++    }
++    let handle = {
++        let state = facetime.state.read().await;
++        let session = state.sessions.get(&guid)?;
++        session.my_handles.iter().find(|h| wanted.contains(&h.to_lowercase()))?.clone()
++    };
++    let link = answer_link(facetime, &handle).await?;
++    let usage = format!("{ANSWER_USAGE_PREFIX}{handle}");
++    let pseud = {
++        let state = facetime.state.read().await;
++        state.links.values().find(|l| l.usage.as_deref() == Some(usage.as_str()))?.pseud.clone()
++    };
++    let mut binds = ANSWER_BINDS.lock().unwrap();
++    binds.retain(|(p, _, at)| p != &pseud && at.elapsed() < ANSWER_WINDOW);
++    binds.push((pseud, guid.clone(), std::time::Instant::now()));
++    info!("FaceTime answer: {handle} is ringing (call {guid}), its link is bound to the call");
++    Some((handle, link))
++}
++
++/// The ringing call a LetMeIn's link was bound to, if the bind is still
++/// fresh. Uses the bind up.
++fn take_answer_bind(pseud: &str) -> Option<String> {
++    let mut binds = ANSWER_BINDS.lock().unwrap();
++    binds.retain(|(_, _, at)| at.elapsed() < ANSWER_WINDOW);
++    let i = binds.iter().position(|(p, _, _)| p == pseud)?;
++    Some(binds.remove(i).1)
++}
++
++/// A LetMeIn on a bound answer link: approve it into the ringing call.
++/// Spawned, because respond_letmein props the call and waits on Apple, and
++/// the receive loop must never wait on that.
++pub(crate) fn maybe_answer_letmein(
++    facetime: std::sync::Arc<rustpush::facetime::FTClient>,
++    event: &rustpush::facetime::FTMessage,
++) {
++    let rustpush::facetime::FTMessage::LetMeInRequest(request) = event else { return };
++    let Some(guid) = take_answer_bind(&request.pseud) else {
++        info!("FaceTime LetMeIn on {} isn't for a ringing answer link, left alone", request.pseud);
++        return;
++    };
++    let request = request.clone();
++    tokio::spawn(async move {
++        info!(
++            "FaceTime answer: letting {} ({:?}) into call {guid}",
++            request.requestor, request.nickname
++        );
++        // The prop needs this device's participant id in the call. Apple
++        // usually pushes one with the ring (a quickrelay allocation); when it
++        // doesn't, rustpush asks for one, and with this account's empty
++        // FaceTime key lookups that request hung 15 s twice and the call rang
++        // out (2026-10-20, 11:31 PM). Skip the prop then: is_ringing_inaccurate
++        // is what makes respond_letmein prop.
++        let my_token = crate::base64_encode(&facetime.conn.get_token().await);
++        {
++            let mut state = facetime.state.write().await;
++            if let Some(session) = state.sessions.get_mut(&guid) {
++                let have_id = session
++                    .participants
++                    .values()
++                    .any(|p| p.token.as_deref() == Some(my_token.as_str()));
++                if !have_id && session.is_ringing_inaccurate {
++                    warn!("FaceTime answer: Apple gave no participant id for call {guid}, letting the web client in without the prop");
++                    session.is_ringing_inaccurate = false;
++                }
++                // A call this bridge started is already propped by create_session.
++                if session.is_propped {
++                    session.is_ringing_inaccurate = false;
++                }
++            }
++        }
++        for attempt in 0..3u32 {
++            let mut req = request.clone();
++            if attempt > 0 {
++                // the first try already used up the delegation entry
++                req.delegation_uuid = None;
++            }
++            let outcome = crate::panic_guard::guard_panic(
++                "FaceTime respond_letmein",
++                facetime.respond_letmein(req, Some(&guid)),
++            )
++            .await;
++            match outcome {
++                Some(Ok(())) => {
++                    info!("FaceTime answer: approved, the web client is joining call {guid}");
++                    return;
++                }
++                Some(Err(rustpush::PushError::SendTimedOut)) if attempt < 2 => {
++                    warn!("FaceTime answer: approve timed out (try {}), retrying", attempt + 1);
++                    tokio::time::sleep(std::time::Duration::from_secs((attempt + 1) as u64)).await;
++                }
++                Some(Err(e)) => {
++                    warn!("FaceTime answer: approving into call {guid} failed: {e:?}");
++                    return;
++                }
++                None => return, // panicked, the guard logged it
++            }
++        }
++    });
++}
++
++/// Have each answer handle's link ready before its first ring (minting it
++/// takes a round trip to Apple, which a ring can't spare).
++pub(crate) fn premint_answer_links(facetime: std::sync::Arc<rustpush::facetime::FTClient>) {
++    let handles = answer_handles();
++    if handles.is_empty() {
++        return;
++    }
++    tokio::spawn(async move {
++        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
++        for handle in handles {
++            if answer_link(facetime.as_ref(), &handle).await.is_some() {
++                info!("FaceTime answer: link ready for {handle}");
++            }
++        }
++    });
++}
++
++// ---------------------------------------------------------------------------
++// Crew patch 2026-10-31: real calls, natively from this bridge, driven from a
++// control port.
++//
++// One command per connection, one line in, one JSON line out, on 127.0.0.1:8010
++// (WSL forwards it to Windows, Shared/call.py and the bots talk to it). Plain
++// lines on purpose: a web page can only send "POST / HTTP/1.1" at it, which is
++// not a command.
++//
++//   keys <via> <handle>   how many of their devices FaceTime can reach
++//   call <via> <handle>   ring them from <via>, the bot's own address
++//   answer <guid>         pick up a call that's ringing
++//   room <via>            a call with nobody else in it (to test the relay)
++//   state <guid>          who's in the call, how the audio is doing
++//   flush <guid>          drop whatever's queued to be said
++//   hangup <guid>         leave the call
++//
++// The audio itself is in facetime_native.rs. With local interfaces set,
++// rustpush's join() opens a real media session instead of the old prop for a
++// web client, so the LetMeIn code above stays idle (no FACETIME_ANSWER_HANDLES
++// in start.sh, no links are minted).
++
++const CONTROL_PORT: u16 = 8010;
++
++static CONTROL_CLIENT: std::sync::Mutex<Option<std::sync::Arc<rustpush::facetime::FTClient>>> =
++    std::sync::Mutex::new(None);
++static CONTROL_STARTED: std::sync::Once = std::sync::Once::new();
++
++pub(crate) fn control_client() -> Option<std::sync::Arc<rustpush::facetime::FTClient>> {
++    CONTROL_CLIENT.lock().unwrap().clone()
++}
++
++/// The address outgoing traffic leaves from. Nothing is actually sent: a UDP
++/// connect only picks the route.
++fn local_address() -> Option<std::net::IpAddr> {
++    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
++    socket.connect(("1.1.1.1", 53)).ok()?;
++    Some(socket.local_addr().ok()?.ip())
++}
++
++/// Point the ports at the current FaceTime client. A reconnect builds a new
++/// client, so the listeners stay up and only this pointer moves.
++pub(crate) fn start_control_port(facetime: std::sync::Arc<rustpush::facetime::FTClient>) {
++    *CONTROL_CLIENT.lock().unwrap() = Some(facetime.clone());
++    tokio::spawn(async move {
++        match local_address() {
++            Some(address) => {
++                info!("FaceTime: native media on {address}");
++                facetime.set_local_interfaces(&[address]).await;
++            }
++            None => warn!("FaceTime: no local address, calls won't connect"),
++        }
++    });
++    crate::facetime_native::start_media_port(control_client);
++    CONTROL_STARTED.call_once(|| {
++        tokio::spawn(async move {
++            let listener = match tokio::net::TcpListener::bind(("127.0.0.1", CONTROL_PORT)).await {
++                Ok(listener) => listener,
++                Err(e) => {
++                    warn!("FaceTime control port {CONTROL_PORT} didn't open: {e}");
++                    return;
++                }
++            };
++            info!("FaceTime control port open on {CONTROL_PORT}");
++            loop {
++                let Ok((stream, _)) = listener.accept().await else { continue };
++                tokio::spawn(control_connection(stream));
++            }
++        });
++    });
++}
++
++async fn control_connection(stream: tokio::net::TcpStream) {
++    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
++    let (read, mut write) = stream.into_split();
++    let mut reader = tokio::io::BufReader::new(read.take(2048));
++    let mut line = String::new();
++    let got = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_line(&mut line)).await;
++    if !matches!(got, Ok(Ok(n)) if n > 0) {
++        return;
++    }
++    let reply = match control_client() {
++        Some(client) => {
++            let line = line.trim().to_string();
++            info!("FaceTime control: {line}");
++            let run = crate::panic_guard::guard_panic("FaceTime control", control_command(client, line));
++            match tokio::time::timeout(std::time::Duration::from_secs(45), run).await {
++                Ok(Some(reply)) => reply,
++                Ok(None) => control_error("panicked"),
++                Err(_) => control_error("timed out"),
++            }
++        }
++        None => control_error("no FaceTime client yet"),
++    };
++    let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
++}
++
++fn control_error(message: &str) -> String {
++    serde_json::json!({ "ok": false, "error": message }).to_string()
++}
++
++async fn control_command(facetime: std::sync::Arc<rustpush::facetime::FTClient>, line: String) -> String {
++    let words: Vec<&str> = line.split_whitespace().collect();
++    match words.as_slice() {
++        ["keys", via, handle] => match facetime.key_count(via, handle, true).await {
++            Ok(devices) => serde_json::json!({ "ok": true, "devices": devices }).to_string(),
++            Err(e) => control_error(&format!("{e:?}")),
++        },
++        ["call", via, handle] => {
++            // Nothing to ring means Apple gave no keys for them: not on
++            // FaceTime, or this account can't see them. Say so instead of
++            // sending an invitation to nobody.
++            match facetime.key_count(via, handle, true).await {
++                Ok(0) => return control_error("no_keys"),
++                Ok(_) => {}
++                Err(e) => return control_error(&format!("{e:?}")),
++            }
++            start_call(&facetime, via, &[handle.to_string()]).await
++        }
++        ["room", via] => start_call(&facetime, via, &[]).await,
++        ["answer", guid] => {
++            {
++                let mut state = facetime.state.write().await;
++                let Some(session) = state.sessions.get_mut(*guid) else {
++                    return control_error("no such call");
++                };
++                if let Err(e) = facetime.join(session, false).await {
++                    warn!("FaceTime call: couldn't answer {guid}: {e:?}");
++                    return control_error(&format!("{e:?}"));
++                }
++                session.is_ringing_inaccurate = false;
++            }
++            wire_audio(&facetime, guid).await
++        }
++        ["codectest"] => crate::facetime_native::codec_roundtrip().to_string(),
++        ["state", guid] => call_state(&facetime, guid).await,
++        ["flush", guid] => serde_json::json!({ "ok": crate::facetime_native::flush_audio(guid) }).to_string(),
++        ["hangup", guid] => {
++            hang_up(&facetime, guid).await;
++            serde_json::json!({ "ok": true }).to_string()
++        }
++        _ => control_error("unknown command"),
++    }
++}
++
++async fn start_call(facetime: &rustpush::facetime::FTClient, via: &str, targets: &[String]) -> String {
++    let guid = uuid::Uuid::new_v4().to_string().to_uppercase();
++    if let Err(e) = facetime.create_session(guid.clone(), via.to_string(), targets, false).await {
++        warn!("FaceTime call: couldn't start {guid}: {e:?}");
++        return control_error(&format!("{e:?}"));
++    }
++    info!("FaceTime call: {via} started {guid} for {targets:?}");
++    wire_audio(facetime, &guid).await
++}
++
++async fn wire_audio(facetime: &rustpush::facetime::FTClient, guid: &str) -> String {
++    let connection = facetime.state.read().await.sessions.get(guid).and_then(|s| s.connection.clone());
++    let Some(connection) = connection else {
++        return control_error("no media session");
++    };
++    crate::facetime_native::start_audio(connection, guid.to_string()).await;
++    serde_json::json!({ "ok": true, "guid": guid }).to_string()
++}
++
++async fn call_state(facetime: &rustpush::facetime::FTClient, guid: &str) -> String {
++    let state = facetime.state.read().await;
++    let Some(session) = state.sessions.get(guid) else {
++        return control_error("no such call");
++    };
++    let in_call: Vec<&str> = session
++        .participants
++        .values()
++        .filter(|p| p.active.is_some())
++        .map(|p| p.handle.as_str())
++        .collect();
++    let members: Vec<&str> = session.members.iter().map(|m| m.handle.as_str()).collect();
++    serde_json::json!({
++        "ok": true,
++        "in_call": in_call,
++        "members": members,
++        "mine": session.my_handles,
++        "connected": session.connection.is_some(),
++        "ringing": session.is_ringing_inaccurate,
++        "audio": crate::facetime_native::audio_stats(guid),
++    })
++    .to_string()
++}
++
++/// Leave the call and stop its audio. Safe to call twice.
++pub(crate) async fn hang_up(facetime: &rustpush::facetime::FTClient, guid: &str) {
++    crate::facetime_native::stop_audio(guid);
++    let mut state = facetime.state.write().await;
++    let Some(session) = state.sessions.get_mut(guid) else { return };
++    session.is_ringing_inaccurate = false;
++    if session.connection.is_none() && !session.is_propped {
++        return;
++    }
++    if let Err(e) = facetime.leave(session).await {
++        warn!("FaceTime call: leaving {guid} failed: {e:?}");
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/pkg/rustpushgo/src/lib.rs b/pkg/rustpushgo/src/lib.rs
+index 199fa1e..7b1c997 100644
+--- a/pkg/rustpushgo/src/lib.rs
++++ b/pkg/rustpushgo/src/lib.rs
+@@ -8,6 +8,7 @@ mod aps_watchdog;
+ mod cloud_message_legacy;
+ mod escrow_bottles;
+ mod escrow_diag;
++mod facetime_native;
+ mod facetime_notify;
+ mod ids_guard;
+ mod panic_guard;
+@@ -32,6 +33,7 @@ use rustpush::{
+     OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, RenameMessage,
+     ChangeParticipantMessage, IconChangeMessage, UnsendMessage, TypingApp,
+     IndexedMessagePart, LinkMeta, LPLinkMetadata, NSURL,
++    LPImageMetadata, LPIconMetadata, RichLinkImageAttachmentSubstitute,
+     TextFlags, TextFormat, TextEffect,
+     ShareProfileMessage, SharedPoster, PartExtension, UpdateExtensionMessage, UpdateProfileMessage,
+     UpdateProfileSharingMessage, SetTranscriptBackgroundMessage,
+@@ -82,7 +84,8 @@ fn bridge_default_provider(
+ use tokio::sync::broadcast;
+ use util::{plist_from_string, plist_to_string};
+ use cloud_message_legacy::{sync_cloud_messages_legacy, LegacyCloudMessage};
+-use facetime_notify::{facetime_event_to_wrapped, read_facetime_state, ringing_snapshot};
++use facetime_notify::{answer_link_for_ring, facetime_event_to_wrapped, maybe_answer_letmein,
++    premint_answer_links, read_facetime_state, ringing_snapshot, start_control_port};
+ 
+ // Local helpers to replace rustpush's private `util::{base64_decode, encode_hex, ...}`.
+ // Part of the zero-patch refactor: `rustpush::util` is private in upstream, so we
+@@ -2953,6 +2956,15 @@ pub struct WrappedPasswordSiteCounts {
+     pub passkey_count: u64,
+ }
+ 
++/// One file of a photo stack (send_attachments).
++#[derive(uniffi::Record, Clone)]
++pub struct WrappedOutboundFile {
++    pub data: Vec<u8>,
++    pub mime: String,
++    pub uti_type: String,
++    pub filename: String,
++}
++
+ #[derive(uniffi::Record, Clone)]
+ pub struct WrappedConversation {
+     pub participants: Vec<String>,
+@@ -3437,6 +3449,9 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
+     let mut italic = false;
+     let mut underline = false;
+     let mut strikethrough = false;
++    // Animated text: <span data-mx-imessage-effect="big">, the same markup
++    // parts_to_html makes for incoming effects (Atlas, 2026-11-17).
++    let mut text_effect: Option<TextEffect> = None;
+ 
+     while pos < len {
+         if bytes[pos] == b'<' {
+@@ -3454,6 +3469,24 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
+                 "/u" => underline = false,
+                 "del" | "s" | "strike" => strikethrough = true,
+                 "/del" | "/s" | "/strike" => strikethrough = false,
++                "/span" => text_effect = None,
++                t if t.starts_with("span") && t.contains("data-mx-imessage-effect") => {
++                    let name = t.split("data-mx-imessage-effect").nth(1).unwrap_or("")
++                        .trim_start_matches(|c: char| c == '=' || c == '"' || c == '\'' || c.is_whitespace())
++                        .split(|c: char| c == '"' || c == '\'' || c.is_whitespace())
++                        .next().unwrap_or("");
++                    text_effect = match name {
++                        "big" => Some(TextEffect::Big),
++                        "small" => Some(TextEffect::Small),
++                        "shake" => Some(TextEffect::Shake),
++                        "nod" => Some(TextEffect::Nod),
++                        "explode" => Some(TextEffect::Explode),
++                        "ripple" => Some(TextEffect::Ripple),
++                        "bloom" => Some(TextEffect::Bloom),
++                        "jitter" => Some(TextEffect::Jitter),
++                        _ => None,
++                    };
++                }
+                 "br" | "br/" | "br /" => {
+                     let flags = TextFlags { bold, italic, underline, strikethrough };
+                     parts.push(IndexedMessagePart {
+@@ -3477,8 +3510,12 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
+                 .replace("&quot;", "\"");
+             if !decoded.is_empty() {
+                 let flags = TextFlags { bold, italic, underline, strikethrough };
++                let format = match text_effect {
++                    Some(e) => TextFormat::Effect(e),
++                    None => TextFormat::Flags(flags),
++                };
+                 parts.push(IndexedMessagePart {
+-                    part: MessagePart::Text(decoded, TextFormat::Flags(flags)),
++                    part: MessagePart::Text(decoded, format),
+                     idx: None,
+                     ext: None,
+                 });
+@@ -3495,7 +3532,7 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
+         MessagePart::Text(t, _) => t.as_str(),
+         _ => "",
+     }).collect();
+-    if reconstructed == plain_text && !parts.iter().any(|p| matches!(&p.part, MessagePart::Text(_, TextFormat::Flags(f)) if f.bold || f.italic || f.underline || f.strikethrough)) {
++    if reconstructed == plain_text && !parts.iter().any(|p| matches!(&p.part, MessagePart::Text(_, TextFormat::Flags(f)) if f.bold || f.italic || f.underline || f.strikethrough) || matches!(&p.part, MessagePart::Text(_, TextFormat::Effect(_)))) {
+         return None;
+     }
+ 
+@@ -4517,6 +4554,9 @@ pub struct LoginSession {
+     username: String,
+     password_hash: Vec<u8>,
+     needs_2fa: bool,
++    // Set when the code goes to a trusted phone number (SMS or voice call)
++    // instead of a trusted device; submit_2fa must verify via the phone endpoint.
++    phone_verify: tokio::sync::Mutex<Option<icloud_auth::VerifyBody>>,
+ }
+ 
+ #[uniffi::export(async_runtime = "tokio")]
+@@ -4565,6 +4605,7 @@ pub async fn login_start(
+         info!("login_start: login_email_pass returned ok");
+ 
+         info!("login_email_pass returned: {:?}", result);
++        let mut phone_verify: Option<icloud_auth::VerifyBody> = None;
+         let needs_2fa = match result {
+             icloud_auth::LoginState::LoggedIn => {
+                 info!("Login completed without 2FA");
+@@ -4574,7 +4615,7 @@ pub async fn login_start(
+                 info!("2FA required (Needs2FAVerification — push already sent by Apple)");
+                 true
+             }
+-            icloud_auth::LoginState::NeedsDevice2FA | icloud_auth::LoginState::NeedsSMS2FA => {
++            icloud_auth::LoginState::NeedsDevice2FA => {
+                 info!("2FA required — sending trusted device push");
+                 match account.send_2fa_to_devices().await {
+                     Ok(_) => info!("send_2fa_to_devices succeeded"),
+@@ -4582,8 +4623,34 @@ pub async fn login_start(
+                 }
+                 true
+             }
+-            icloud_auth::LoginState::NeedsSMS2FAVerification(_) => {
++            icloud_auth::LoginState::NeedsSMS2FA => {
++                // No trusted devices: the code goes to a trusted phone number.
++                let extras = account.get_auth_extras().await
++                    .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get 2FA phone numbers: {}", e) })?;
++                for p in &extras.trusted_phone_numbers {
++                    info!("trusted phone: ..{} mode={} id={}", p.last_two_digits, p.push_mode, p.id);
++                }
++                match extras.new_state {
++                    Some(icloud_auth::LoginState::NeedsSMS2FAVerification(body)) => {
++                        info!("2FA code already sent to trusted phone by Apple");
++                        phone_verify = Some(body);
++                    }
++                    _ => {
++                        let p = extras.trusted_phone_numbers.first()
++                            .ok_or(WrappedError::GenericError { msg: "No trusted phone numbers on account".to_string() })?;
++                        info!("Requesting 2FA code to ..{} via {}", p.last_two_digits, p.push_mode);
++                        match account.send_phone_2fa(p.id, p.push_mode.clone()).await {
++                            Ok(icloud_auth::LoginState::NeedsSMS2FAVerification(body)) => phone_verify = Some(body),
++                            Ok(other) => return Err(WrappedError::GenericError { msg: format!("Unexpected state after phone 2FA request: {:?}", other) }),
++                            Err(e) => return Err(WrappedError::GenericError { msg: format!("Phone 2FA request failed: {}", e) }),
++                        }
++                    }
++                }
++                true
++            }
++            icloud_auth::LoginState::NeedsSMS2FAVerification(body) => {
+                 info!("2FA required (NeedsSMS2FAVerification — SMS already sent)");
++                phone_verify = Some(body);
+                 true
+             }
+             icloud_auth::LoginState::NeedsExtraStep(ref step) => {
+@@ -4604,6 +4671,7 @@ pub async fn login_start(
+             username: user_trimmed,
+             password_hash: pw_bytes,
+             needs_2fa,
++            phone_verify: tokio::sync::Mutex::new(phone_verify),
+         }))
+     }).await
+ }
+@@ -4619,9 +4687,14 @@ impl LoginSession {
+             let mut guard = self.account.lock().await;
+             let account = guard.as_mut().ok_or(WrappedError::GenericError { msg: "No active session".to_string() })?;
+ 
+-            info!("Verifying 2FA code via trusted device endpoint (verify_2fa)");
+-            let result = account.verify_2fa(code).await
+-                .map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?;
++            let phone_body = self.phone_verify.lock().await.clone();
++            let result = if let Some(body) = phone_body {
++                info!("Verifying 2FA code via trusted phone endpoint (verify_sms_2fa)");
++                account.verify_sms_2fa(code, body).await
++            } else {
++                info!("Verifying 2FA code via trusted device endpoint (verify_2fa)");
++                account.verify_2fa(code).await
++            }.map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?;
+ 
+             info!("2FA verification returned: {:?}", result);
+             info!("PET token available: {}", account.get_pet().is_some());
+@@ -4677,12 +4750,23 @@ impl LoginSession {
+             };
+ 
+             // Request both IDS (for messaging) and MobileMe (for contacts CardDAV URL)
+-            let delegates = login_apple_delegates(
++            let delegates = match login_apple_delegates(
+                 &*account,
+                 None,
+                 &*os_config,
+                 &[LoginDelegate::IDS, LoginDelegate::MobileMe],
+-            ).await.map_err(|e| WrappedError::GenericError { msg: format!("Failed to get delegates: {}", e) })?;
++            ).await {
++                Ok(d) => d,
++                // Fresh accounts that never signed in to iCloud on a device fail the
++                // MobileMe delegate with MOBILEME_TERMS_OF_SERVICE_UPDATE. iMessage only
++                // needs IDS, so retry without MobileMe (loses iCloud contacts/backfill).
++                Err(e) if format!("{}", e).contains("TERMS_OF_SERVICE") || matches!(e, rustpush::PushError::UnauthorizedAccountError) => {
++                    warn!("MobileMe delegate needs iCloud ToS ({}); retrying with IDS only", e);
++                    login_apple_delegates(&*account, None, &*os_config, &[LoginDelegate::IDS])
++                        .await.map_err(|e| WrappedError::GenericError { msg: format!("Failed to get IDS delegate: {}", e) })?
++                }
++                Err(e) => return Err(WrappedError::GenericError { msg: format!("Failed to get delegates: {}", e) }),
++            };
+ 
+             let ids_delegate = delegates.ids.ok_or(WrappedError::GenericError { msg: "No IDS delegate in response".to_string() })?;
+             let fresh_user = authenticate_apple(ids_delegate, &*os_config).await
+@@ -5677,6 +5761,9 @@ pub async fn new_client(
+         )
+         .await,
+     );
++    // Crew patch (Atlas FaceTime): answer links ready before the first ring.
++    premint_answer_links(facetime_client.clone());
++    start_control_port(facetime_client.clone());
+ 
+     // Shared StatusKit state: init_statuskit() populates these Arc<RwLock>s,
+     // and the receive loop below reads them on every message. The raw
+@@ -6570,7 +6657,12 @@ pub async fn new_client(
+                 };
+                 match ft_result {
+                     Ok(Some(ft_message)) => {
+-                        if let Some(wrapped) = facetime_event_to_wrapped(ft_for_recv.as_ref(), &ft_message, &ringing_before).await {
++                        // Crew patch (Atlas FaceTime): approve a web client
++                        // knocking on a ringing answer link (spawned), and
++                        // put the answer link in ring notices.
++                        maybe_answer_letmein(ft_for_recv.clone(), &ft_message);
++                        let answer = answer_link_for_ring(ft_for_recv.as_ref(), &ft_message).await;
++                        if let Some(wrapped) = facetime_event_to_wrapped(ft_for_recv.as_ref(), &ft_message, &ringing_before, answer).await {
+                             callback.on_message(wrapped);
+                         }
+                     }
+@@ -7266,6 +7358,25 @@ impl Client {
+     }
+ }
+ 
++// Crew patch 2026-10-20: the published shared name/photo record (see
++// Client::publish_profile). Cached in memory and saved to
++// ~/imessage-bridge/state/shared-profile.plist so a bridge restart keeps
++// sharing the same record instead of republishing (which breaks old shares).
++static SHARED_PROFILE: std::sync::Mutex<Option<ShareProfileMessage>> = std::sync::Mutex::new(None);
++
++fn shared_profile_path() -> std::path::PathBuf {
++    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
++        .join("imessage-bridge/state/shared-profile.plist")
++}
++
++fn current_shared_profile() -> Option<ShareProfileMessage> {
++    let mut cached = SHARED_PROFILE.lock().unwrap();
++    if cached.is_none() {
++        *cached = plist::from_file(shared_profile_path()).ok();
++    }
++    cached.clone()
++}
++
+ #[uniffi::export(async_runtime = "tokio")]
+ impl Client {
+     /// Reset the cached CloudKit client so the next CloudKit operation
+@@ -8352,13 +8463,28 @@ impl Client {
+             MessageType::IMessage
+         };
+ 
+-        // Parse rich link encoded as prefix: \x00RL\x01original_url\x01url\x01title\x01summary\x00actual_text
++        // Parse rich link encoded as prefix:
++        // \x00RL\x01original_url\x01url\x01title\x01summary[\x01image_path\x01image_url\x01width\x01height\x01kind]\x00actual_text
++        // The image fields come from richlink_image.go (Atlas, 2026-11-17): a
++        // temp JPEG of the page's preview picture, or of its icon when kind is
++        // "icon". They're optional, so the old four-field form still works.
++        // Bubble/screen effect from outbound_style.go: \x00FX\x01<apple effect id>\x00 in
++        // front of the rest (Atlas, 2026-11-17).
++        let (effect, text) = if text.starts_with("\x00FX\x01") {
++            match text[4..].find('\x00') {
++                Some(end) => (Some(text[4..4 + end].to_string()), text[4 + end + 1..].to_string()),
++                None => (None, text),
++            }
++        } else {
++            (None, text)
++        };
++
+         let (actual_text, link_meta) = if text.starts_with("\x00RL\x01") {
+             let rest = &text[4..]; // skip "\x00RL\x01"
+             if let Some(end) = rest.find('\x00') {
+                 let metadata = &rest[..end];
+                 let actual = rest[end + 1..].to_string();
+-                let fields: Vec<&str> = metadata.splitn(4, '\x01').collect();
++                let fields: Vec<&str> = metadata.splitn(9, '\x01').collect();
+                 let original_url_str = fields.first().copied().unwrap_or("");
+                 let url_str = fields.get(1).copied().unwrap_or("");
+                 let title_str = fields.get(2).copied().unwrap_or("");
+@@ -8379,19 +8505,70 @@ impl Client {
+                 let title = if title_str.is_empty() { None } else { Some(title_str.to_string()) };
+                 let summary = if summary_str.is_empty() { None } else { Some(summary_str.to_string()) };
+ 
+-                info!("Sending rich link: url={}, title={:?}", original_url_str, title);
++                // The preview picture, the way an iPhone sends it: the bytes ride
++                // in the balloon's attachment list and image (or icon) points at
++                // them by index. A missing or unreadable file just means the
++                // title-only card.
++                let image_path = fields.get(4).copied().unwrap_or("");
++                let image_url = fields.get(5).copied().unwrap_or("");
++                let image_w: u32 = fields.get(6).and_then(|v| v.parse().ok()).unwrap_or(0);
++                let image_h: u32 = fields.get(7).and_then(|v| v.parse().ok()).unwrap_or(0);
++                let is_icon = fields.get(8).copied() == Some("icon");
++                let image_bytes = if image_path.is_empty() {
++                    None
++                } else {
++                    let read = std::fs::read(image_path);
++                    let _ = std::fs::remove_file(image_path);
++                    match read {
++                        Ok(b) if !b.is_empty() => Some(b),
++                        Ok(_) => None,
++                        Err(e) => {
++                            warn!("Rich link picture {} unreadable, sending the card without it: {}", image_path, e);
++                            None
++                        }
++                    }
++                };
++                let picture_url = NSURL {
++                    base: "$null".to_string(),
++                    relative: if image_url.is_empty() { original_url_str.to_string() } else { image_url.to_string() },
++                };
++                let substitute = RichLinkImageAttachmentSubstitute {
++                    mime_type: "image/jpeg".to_string(),
++                    rich_link_image_attachment_substitute_index: 0,
++                };
++                let (image, image_metadata, icon, icon_metadata) = match (&image_bytes, is_icon) {
++                    (None, _) => (None, None, None, None),
++                    (Some(_), false) => (
++                        Some(substitute),
++                        Some(LPImageMetadata {
++                            size: format!("{{{}, {}}}", image_w, image_h),
++                            url: picture_url,
++                            version: 1,
++                        }),
++                        None,
++                        None,
++                    ),
++                    (Some(_), true) => (
++                        None,
++                        None,
++                        Some(substitute),
++                        Some(LPIconMetadata { url: picture_url, version: 1 }),
++                    ),
++                };
++
++                info!("Sending rich link: url={}, title={:?}, picture={}", original_url_str, title, if image_path.is_empty() { "none" } else if is_icon { "icon" } else { "image" });
+ 
+                 let lm = LinkMeta {
+                     data: LPLinkMetadata {
+-                        image_metadata: None,
++                        image_metadata,
+                         version: 1,
+-                        icon_metadata: None,
++                        icon_metadata,
+                         original_url: Some(original_url),
+                         url,
+                         title,
+                         summary,
+-                        image: None,
+-                        icon: None,
++                        image,
++                        icon,
+                         images: None,
+                         icons: None,
+                         is_incomplete: None,
+@@ -8400,7 +8577,7 @@ impl Client {
+                         collaboration_type: None,
+                         specialization2: None,
+                     },
+-                    attachments: vec![],
++                    attachments: image_bytes.into_iter().collect(),
+                 };
+                 (actual, Some(lm))
+             } else {
+@@ -8421,7 +8598,7 @@ impl Client {
+         let normal = if let Some(parts) = parts {
+             NormalMessage {
+                 parts,
+-                effect: None,
++                effect: effect.clone(),
+                 reply_guid: reply_guid.clone(),
+                 reply_part: reply_part.clone(),
+                 service: service.clone(),
+@@ -8434,6 +8611,7 @@ impl Client {
+             }
+         } else {
+             let mut n = NormalMessage::new(actual_text.clone(), service.clone());
++            n.effect = effect.clone();
+             n.link_meta = link_meta;
+             n.reply_guid = reply_guid.clone();
+             n.reply_part = reply_part.clone();
+@@ -8525,6 +8703,53 @@ impl Client {
+         Ok(())
+     }
+ 
++    /// Crew patch 2026-10-20: publish this account's shared name and photo
++    /// (iMessage "Share Name and Photo"). Kept in SHARED_PROFILE so every
++    /// later share reuses the same record: publishing again deletes the old
++    /// record, which would break shares already sent.
++    pub async fn publish_profile(
++        &self,
++        display_name: String,
++        first_name: String,
++        last_name: String,
++        image: Option<Vec<u8>>,
++    ) -> Result<(), WrappedError> {
++        let profiles = self.get_or_init_profiles_client().await?;
++        let record = rustpush::name_photo_sharing::IMessageNicknameRecord {
++            name: rustpush::name_photo_sharing::IMessageNameRecord {
++                name: display_name,
++                first: first_name,
++                last: last_name,
++            },
++            image,
++            poster: None,
++        };
++        let mut existing = current_shared_profile();
++        profiles.set_record(record, &mut existing).await
++            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to publish profile: {}", e) })?;
++        if let Some(share) = &existing {
++            let _ = plist::to_file_xml(shared_profile_path(), share);
++        }
++        *SHARED_PROFILE.lock().unwrap() = existing;
++        Ok(())
++    }
++
++    /// Crew patch 2026-10-20: send the published name/photo to one
++    /// conversation, from `handle`. Call publish_profile first.
++    pub async fn send_profile_share(
++        &self,
++        conversation: WrappedConversation,
++        handle: String,
++    ) -> Result<(), WrappedError> {
++        let share = current_shared_profile()
++            .ok_or_else(|| WrappedError::GenericError { msg: "No profile published yet".to_string() })?;
++        let conv: ConversationData = (&conversation).into();
++        let mut msg = MessageInst::new(conv, &handle, Message::ShareProfile(share));
++        self.client.send(&mut msg).await
++            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send profile share: {}", e) })?;
++        Ok(())
++    }
++
+     pub async fn send_typing_with_app(
+         &self,
+         conversation: WrappedConversation,
+@@ -9169,6 +9394,69 @@ impl Client {
+         Ok(lines.join("\n"))
+     }
+ 
++    /// Several photos or videos in ONE message, the way an iPhone sends a
++    /// stack (Atlas, 2026-11-17). send_attachment sends one file per message,
++    /// so a bot's three pictures used to land as three separate bubbles.
++    /// Every file becomes an attachment part of the same NormalMessage; the
++    /// caption, if any, rides in the subject like send_attachment's.
++    pub async fn send_attachments(
++        &self,
++        conversation: WrappedConversation,
++        files: Vec<WrappedOutboundFile>,
++        handle: String,
++        reply_guid: Option<String>,
++        reply_part: Option<String>,
++        body: Option<String>,
++    ) -> Result<String, WrappedError> {
++        if files.is_empty() {
++            return Err(WrappedError::GenericError { msg: "send_attachments: no files".to_string() });
++        }
++        if conversation.is_sms {
++            return Err(WrappedError::GenericError { msg: "send_attachments: photo stacks are iMessage only".to_string() });
++        }
++        let conv: ConversationData = (&conversation).into();
++        let mut parts = Vec::with_capacity(files.len());
++        for f in &files {
++            let prepared = MMCSFile::prepare_put(Cursor::new(&f.data)).await
++                .map_err(|e| WrappedError::GenericError { msg: format!("Failed to prepare MMCS upload of {}: {}", f.filename, e) })?;
++            let attachment = Attachment::new_mmcs(
++                &self.conn,
++                &prepared,
++                Cursor::new(&f.data),
++                &f.mime,
++                &f.uti_type,
++                &f.filename,
++                |_current, _total| {},
++            ).await.map_err(|e| WrappedError::GenericError { msg: format!("Failed to upload {}: {}", f.filename, e) })?;
++            parts.push(IndexedMessagePart {
++                part: MessagePart::Attachment(attachment),
++                idx: None,
++                ext: None,
++            });
++        }
++        info!("Sending a stack of {} attachments", parts.len());
++        let mut msg = MessageInst::new(
++            conv,
++            &handle,
++            Message::Message(NormalMessage {
++                parts: MessageParts(parts),
++                effect: None,
++                reply_guid,
++                reply_part,
++                service: MessageType::IMessage,
++                subject: body.filter(|s| !s.is_empty()),
++                app: None,
++                link_meta: None,
++                voice: false,
++                scheduled: None,
++                embedded_profile: None,
++            }),
++        );
++        self.send_with_flap_retry(&mut msg).await
++            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send attachment stack: {}", e) })?;
++        Ok(msg.id.clone())
++    }
++
+     pub async fn send_attachment(
+         &self,
+         conversation: WrappedConversation,
+diff --git a/scripts/bootstrap-linux.sh b/scripts/bootstrap-linux.sh
+index 123f780..9f054d8 100755
+--- a/scripts/bootstrap-linux.sh
++++ b/scripts/bootstrap-linux.sh
+@@ -34,7 +34,8 @@ dpkg -s libheif-dev    >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libheif-de
+ command -v sqlite3 >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES sqlite3"
+ 
+ # Deduplicate
+-APT_PACKAGES=$(echo "$APT_PACKAGES" | tr ' ' '\n' | sort -u | tr '\n' ' ')
++APT_PACKAGES=$(echo $APT_PACKAGES | tr " " "
++" | sort -u | xargs)
+ 
+ if [ -n "$APT_PACKAGES" ]; then
+     echo "Installing system packages:$APT_PACKAGES"
+diff --git a/pkg/connector/outbound_style.go b/pkg/connector/outbound_style.go
+new file mode 100644
+index 0000000..9b82701
+--- /dev/null
++++ b/pkg/connector/outbound_style.go
+@@ -0,0 +1,124 @@
++package connector
++
++// Bubble effects, screen effects and text formatting on outgoing messages
++// (Atlas, 2026-11-17). Before this the bridge sent every message as plain
++// text: it passed no HTML to rustpush and always sent effect None, so the
++// bots could never slam a text, send confetti or bold a word the way a
++// person on an iPhone can.
++//
++// A bot asks for an effect with the custom field "com.atlas.effect" on its
++// m.text event (a friendly name like "slam" or "confetti", or a raw Apple
++// effect id), and for formatting with an ordinary org.matrix.custom.html
++// formatted_body (<b> <i> <u> <s> and
++// <span data-mx-imessage-effect="big">, the same markup the bridge already
++// produces for the owner's incoming formatting).
++
++import (
++	"html"
++	"regexp"
++	"strings"
++
++	"maunium.net/go/mautrix/bridgev2"
++	"maunium.net/go/mautrix/event"
++)
++
++const effectKey = "com.atlas.effect"
++
++// notifyAnywayKey on a bot's message (true) makes it break through the
++// recipient's Focus, like tapping "Notify Anyway" on an iPhone.
++const notifyAnywayKey = "com.atlas.notify_anyway"
++
++func wantsNotifyAnyway(msg *bridgev2.MatrixMessage) bool {
++	if msg == nil || msg.Event == nil {
++		return false
++	}
++	v, _ := msg.Event.Content.Raw[notifyAnywayKey].(bool)
++	return v
++}
++
++// iMessage's own effect ids, by the names on the iPhone's "Send with
++// effect" screen.
++var outboundEffects = map[string]string{
++	// Bubble
++	"slam":          "com.apple.MobileSMS.expressivesend.impact",
++	"loud":          "com.apple.MobileSMS.expressivesend.loud",
++	"gentle":        "com.apple.MobileSMS.expressivesend.gentle",
++	"invisible ink": "com.apple.MobileSMS.expressivesend.invisibleink",
++	// Screen
++	"echo":          "com.apple.messages.effect.CKEchoEffect",
++	"spotlight":     "com.apple.messages.effect.CKSpotlightEffect",
++	"balloons":      "com.apple.messages.effect.CKHappyBirthdayEffect",
++	"confetti":      "com.apple.messages.effect.CKConfettiEffect",
++	"love":          "com.apple.messages.effect.CKHeartEffect",
++	"lasers":        "com.apple.messages.effect.CKLasersEffect",
++	"fireworks":     "com.apple.messages.effect.CKFireworksEffect",
++	"celebration":   "com.apple.messages.effect.CKSparklesEffect",
++	"shooting star": "com.apple.messages.effect.CKShootingStarEffect",
++}
++
++// outboundEffect is the Apple effect id the bot asked for, or "".
++func outboundEffect(msg *bridgev2.MatrixMessage) string {
++	if msg == nil || msg.Event == nil {
++		return ""
++	}
++	raw, _ := msg.Event.Content.Raw[effectKey].(string)
++	name := strings.ToLower(strings.TrimSpace(raw))
++	name = strings.NewReplacer("_", " ", "-", " ").Replace(name)
++	if id, ok := outboundEffects[name]; ok {
++		return id
++	}
++	switch name {
++	case "invisibleink", "ink":
++		return outboundEffects["invisible ink"]
++	case "heart", "hearts":
++		return outboundEffects["love"]
++	case "sparkles":
++		return outboundEffects["celebration"]
++	case "shootingstar":
++		return outboundEffects["shooting star"]
++	}
++	// A raw id passes through as long as it is one of Apple's.
++	if strings.HasPrefix(raw, "com.apple.MobileSMS.expressivesend.") ||
++		strings.HasPrefix(raw, "com.apple.messages.effect.CK") {
++		return strings.TrimSpace(raw)
++	}
++	return ""
++}
++
++var htmlTagRegex = regexp.MustCompile(`<[^>]*>`)
++var htmlParagraphEnd = regexp.MustCompile(`(?i)</p\s*>\s*`)
++var htmlParagraphStart = regexp.MustCompile(`(?i)<p(\s[^>]*)?>`)
++
++// outboundHTML returns the message's HTML in the shape rustpush's
++// parse_html_to_parts reads: tags it knows, text with only &amp; &lt; &gt;
++// and &quot; escaped (it decodes nothing else, so &#39; or &nbsp; would show
++// up literally on the phone), and paragraphs turned into line breaks (it
++// drops <p> without one). nil when there's no formatting to send.
++func outboundHTML(content *event.MessageEventContent) *string {
++	if content == nil || content.Format != event.FormatHTML || content.FormattedBody == "" {
++		return nil
++	}
++	src := htmlParagraphEnd.ReplaceAllString(content.FormattedBody, "<br><br>")
++	src = htmlParagraphStart.ReplaceAllString(src, "")
++	src = strings.TrimSuffix(src, "<br><br>")
++
++	var out strings.Builder
++	last := 0
++	for _, loc := range htmlTagRegex.FindAllStringIndex(src, -1) {
++		out.WriteString(reescapeText(src[last:loc[0]]))
++		out.WriteString(src[loc[0]:loc[1]])
++		last = loc[1]
++	}
++	out.WriteString(reescapeText(src[last:]))
++	s := out.String()
++	return &s
++}
++
++func reescapeText(s string) string {
++	if s == "" {
++		return s
++	}
++	s = html.UnescapeString(s)
++	s = strings.ReplaceAll(s, " ", " ")
++	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;").Replace(s)
++}
+diff --git a/pkg/connector/richlink_image.go b/pkg/connector/richlink_image.go
+new file mode 100644
+index 0000000..f537e45
+--- /dev/null
++++ b/pkg/connector/richlink_image.go
+@@ -0,0 +1,175 @@
++package connector
++
++// Preview pictures on outgoing links (Atlas, 2026-11-17).
++//
++// The bridge sent every outgoing link as a title-only card: LPLinkMetadata
++// went out with no image, so the iPhone drew a compass icon where the
++// picture should be. An iPhone sends the preview picture inside the URL
++// balloon itself: the image bytes go in the balloon's attachment list and
++// LPLinkMetadata.image points at them by index. This file fetches the
++// page's og:image / twitter:image, shrinks it to a sane JPEG and leaves it
++// in a temp file; the Rust side (send_message in rustpushgo) reads the file,
++// deletes it and builds the balloon.
++
++import (
++	"bytes"
++	"context"
++	"image"
++	"image/jpeg"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++
++	_ "image/gif"
++	_ "image/png"
++
++	"github.com/rs/zerolog"
++	"golang.org/x/image/draw"
++	_ "golang.org/x/image/webp"
++)
++
++const (
++	// Longest side of the picture we send. iPhones show the card at about
++	// 300 points wide, so 1200 px is sharp at 3x and keeps the balloon small.
++	richLinkMaxSide = 1200
++	// Pictures smaller than this are favicons or tracking pixels, not a
++	// preview picture worth a card.
++	richLinkMinSide = 120
++	// The site icon shows small beside the title; favicons are often 32 px.
++	richLinkIconMinSide = 32
++	richLinkIconMaxSide = 256
++	// Target size of the encoded JPEG. The balloon goes up through MMCS, so
++	// this is about keeping sends quick, not a hard limit.
++	richLinkMaxBytes = 600 * 1024
++	// Temp files the Rust side never picked up (a send that failed before it
++	// got that far) are cleared after this long.
++	richLinkStaleAfter = time.Hour
++	richLinkFilePrefix = "richlink-"
++)
++
++// richLinkImage is a preview picture ready to send.
++type richLinkImage struct {
++	Path   string // temp JPEG; the Rust side deletes it once read
++	URL    string // where the picture came from (LPImageMetadata.URL)
++	Width  int
++	Height int
++}
++
++// prepareRichLinkImage downloads the preview picture `imageRef` (as found in
++// the page at `pageURL`, so it may be relative) and writes it as a JPEG temp
++// file. `isIcon` is for the site's icon, which is small and square, instead
++// of the page's big picture. It returns nil when there is no usable picture;
++// a link then goes out as the old title-only card, never not at all.
++func prepareRichLinkImage(ctx context.Context, pageURL, imageRef string, isIcon bool) *richLinkImage {
++	log := zerolog.Ctx(ctx)
++	clearStaleRichLinkFiles()
++
++	imageRef = strings.TrimSpace(imageRef)
++	if imageRef == "" {
++		return nil
++	}
++	base, err := url.Parse(pageURL)
++	if err != nil {
++		return nil
++	}
++	ref, err := url.Parse(imageRef)
++	if err != nil {
++		return nil
++	}
++	abs := base.ResolveReference(ref)
++	if abs.Scheme != "http" && abs.Scheme != "https" {
++		return nil
++	}
++	imageURL := abs.String()
++
++	fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
++	defer cancel()
++	data, _, err := downloadURL(fetchCtx, imageURL)
++	if err != nil {
++		log.Debug().Err(sanitizeURLError(err, imageURL)).Msg("Couldn't download the link preview picture")
++		return nil
++	}
++	src, format, err := image.Decode(bytes.NewReader(data))
++	if err != nil {
++		log.Debug().Err(err).Int("bytes", len(data)).Msg("Link preview picture isn't an image we can read")
++		return nil
++	}
++	b := src.Bounds()
++	minSide, maxSide := richLinkMinSide, richLinkMaxSide
++	if isIcon {
++		minSide, maxSide = richLinkIconMinSide, richLinkIconMaxSide
++	}
++	if b.Dx() < minSide || b.Dy() < minSide {
++		log.Debug().Int("width", b.Dx()).Int("height", b.Dy()).Msg("Link preview picture too small, sending the card without it")
++		return nil
++	}
++
++	w, h := b.Dx(), b.Dy()
++	if w > maxSide || h > maxSide {
++		if w >= h {
++			h = h * maxSide / w
++			w = maxSide
++		} else {
++			w = w * maxSide / h
++			h = maxSide
++		}
++	}
++	// Always redraw onto an opaque white canvas: it flattens PNG/WebP
++	// transparency (JPEG has none, and a transparent logo would turn black)
++	// and scales in the same step.
++	dst := image.NewRGBA(image.Rect(0, 0, w, h))
++	draw.Draw(dst, dst.Bounds(), image.White, image.Point{}, draw.Src)
++	draw.CatmullRom.Scale(dst, dst.Bounds(), src, b, draw.Over, nil)
++
++	var out []byte
++	for _, q := range []int{85, 75, 65, 55} {
++		var buf bytes.Buffer
++		if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: q}); err != nil {
++			log.Debug().Err(err).Msg("Couldn't encode the link preview picture")
++			return nil
++		}
++		out = buf.Bytes()
++		if len(out) <= richLinkMaxBytes {
++			break
++		}
++	}
++
++	f, err := os.CreateTemp("", richLinkFilePrefix+"*.jpg")
++	if err != nil {
++		log.Warn().Err(err).Msg("Couldn't save the link preview picture")
++		return nil
++	}
++	if _, err := f.Write(out); err != nil {
++		f.Close()
++		os.Remove(f.Name())
++		return nil
++	}
++	f.Close()
++
++	log.Debug().Bool("icon", isIcon).Str("format", format).Int("width", w).Int("height", h).Int("bytes", len(out)).
++		Msg("Link preview picture ready")
++	return &richLinkImage{Path: f.Name(), URL: imageURL, Width: w, Height: h}
++}
++
++// richLinkField strips the two bytes the sideband envelope uses as
++// separators (\x00 ends the envelope, \x01 splits its fields). A page title
++// carrying either would shift every field after it.
++func richLinkField(s string) string {
++	return strings.Map(func(r rune) rune {
++		if r == 0 || r == 1 {
++			return -1
++		}
++		return r
++	}, s)
++}
++
++func clearStaleRichLinkFiles() {
++	matches, _ := filepath.Glob(filepath.Join(os.TempDir(), richLinkFilePrefix+"*.jpg"))
++	for _, m := range matches {
++		if fi, err := os.Stat(m); err == nil && time.Since(fi.ModTime()) > richLinkStaleAfter {
++			os.Remove(m)
++		}
++	}
++}
+diff --git a/pkg/connector/stack.go b/pkg/connector/stack.go
+new file mode 100644
+index 0000000..2c63025
+--- /dev/null
++++ b/pkg/connector/stack.go
+@@ -0,0 +1,95 @@
++package connector
++
++// Photo stacks (Atlas, 2026-11-17). An iPhone sends several pictures picked
++// together as ONE message that shows as a stack; the bridge could only send
++// one file per message, so a bot's three pictures landed as three bubbles.
++//
++// A bot sends the first picture as a normal m.image and lists the rest in
++// "com.atlas.stack": [{"url": "mxc://...", "mimetype": "image/jpeg",
++// "filename": "x.jpg"}, ...]. handleMatrixFile sends them all with
++// SendAttachments.
++
++import (
++	"bytes"
++	"context"
++	"image/jpeg"
++	"path/filepath"
++	"strings"
++
++	"github.com/rs/zerolog"
++	"maunium.net/go/mautrix/bridgev2"
++	"maunium.net/go/mautrix/id"
++
++	"github.com/lrhodin/imessage/pkg/rustpushgo"
++)
++
++const stackKey = "com.atlas.stack"
++
++// An iPhone caps a stack well above this; ten keeps a bot from flooding.
++const maxStackExtras = 9
++
++// stackExtras downloads the extra files a bot listed and readies them the
++// same way handleMatrixFile readies the first one. A file that fails to
++// download is left out rather than failing the whole stack.
++func (c *IMClient) stackExtras(ctx context.Context, msg *bridgev2.MatrixMessage) []rustpushgo.WrappedOutboundFile {
++	if msg == nil || msg.Event == nil {
++		return nil
++	}
++	list, _ := msg.Event.Content.Raw[stackKey].([]any)
++	if len(list) == 0 {
++		return nil
++	}
++	log := zerolog.Ctx(ctx)
++	var out []rustpushgo.WrappedOutboundFile
++	for _, item := range list {
++		if len(out) >= maxStackExtras {
++			break
++		}
++		m, _ := item.(map[string]any)
++		url, _ := m["url"].(string)
++		if !strings.HasPrefix(url, "mxc://") {
++			continue
++		}
++		mime, _ := m["mimetype"].(string)
++		name, _ := m["filename"].(string)
++		if name == "" {
++			name = "photo"
++		}
++		data, err := c.Main.Bridge.Bot.DownloadMedia(ctx, id.ContentURIString(url), nil)
++		if err != nil {
++			log.Warn().Err(err).Str("url", url).Msg("Couldn't download a stack photo; sending the rest")
++			continue
++		}
++		data, mime, name = readyStackFile(data, mime, name)
++		out = append(out, rustpushgo.WrappedOutboundFile{
++			Data: data, Mime: mime, UtiType: mimeToUTI(mime), Filename: name,
++		})
++	}
++	return out
++}
++
++// readyStackFile mirrors handleMatrixFile's image handling: trust the bytes
++// over the label, keep JPEG/PNG/GIF/HEIC as they are, and turn anything an
++// iPhone can't show (WebP, TIFF, BMP) into JPEG.
++func readyStackFile(data []byte, mime, name string) ([]byte, string, string) {
++	if !looksLikeImage(data) {
++		if mime == "" {
++			mime = "application/octet-stream"
++		}
++		return data, mime, name
++	}
++	if detected := detectImageMIME(data); detected != "" {
++		mime = detected
++	}
++	switch mime {
++	case "image/jpeg", "image/png", "image/gif", "image/heic", "image/heif":
++		return data, mime, name
++	}
++	if img, _, _ := decodeImageData(data); img != nil {
++		var buf bytes.Buffer
++		if jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}) == nil {
++			return buf.Bytes(), "image/jpeg", strings.TrimSuffix(name, filepath.Ext(name)) + ".jpg"
++		}
++	}
++	return data, mime, name
++}
+diff --git a/pkg/connector/share_profile.go b/pkg/connector/share_profile.go
+new file mode 100755
+index 0000000..9c98b8f
+--- /dev/null
++++ b/pkg/connector/share_profile.go
+@@ -0,0 +1,143 @@
++package connector
++
++// Shared name and photo (iMessage "Share Name and Photo"), the crew
++// patch 2026-10-20. The whole Apple account shows up as one identity
++// ("Iris"); each bot's +alias is its own thread, and the owner names the aliases
++// as separate contacts on his own phone.
++//
++//   share-profile <tel:+1...|mailto:...> [display name]
++//
++// Publishes the name (and ~/imessage-bridge/state/profile-photo.jpg if it
++// exists) once, then sends the share to that person from every +alias, so
++// every thread they have with the crew gets the "Share your name and photo?"
++// banner. The plain address is left alone.
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++
++	"maunium.net/go/mautrix/bridgev2/commands"
++)
++
++var cmdShareProfile = &commands.FullHandler{
++	Name: "share-profile",
++	Func: fnShareProfile,
++	Help: commands.HelpMeta{
++		Section:     commands.HelpSectionChats,
++		Description: "Publish the account's shared name/photo and share it with someone from every +alias. Usage: `$cmdprefix share-profile <tel:+1...|mailto:...> [display name]`",
++	},
++	RequiresLogin: true,
++}
++
++// publishProfile publishes the account's shared name + photo
++// (~/imessage-bridge/state/profile-photo.jpg if present).
++func publishProfile(client *IMClient, name string) (bool, error) {
++	var photo *[]byte
++	if home, err := os.UserHomeDir(); err == nil {
++		if data, err := os.ReadFile(filepath.Join(home, "imessage-bridge", "state", "profile-photo.jpg")); err == nil && len(data) > 0 {
++			photo = &data
++		}
++	}
++	first := strings.Fields(name)[0]
++	return photo != nil, client.client.PublishProfile(name, first, "", photo)
++}
++
++func commandClient(ce *commands.Event) *IMClient {
++	logins := ce.User.GetCachedUserLogins()
++	if len(logins) == 0 {
++		ce.Reply("You're not signed in to iMessage.")
++		return nil
++	}
++	client, ok := logins[0].Client.(*IMClient)
++	if !ok || client == nil || client.client == nil {
++		ce.Reply("The bridge client isn't ready yet. Try again in a minute.")
++		return nil
++	}
++	return client
++}
++
++// send-profile <target> [from-handle]: send the already-published name/photo
++// to one person from one of our handles, WITHOUT republishing (republishing
++// replaces the record and breaks shares already sent). Publishes first only
++// if nothing has been published since the bridge started. Iris runs this after
++// his first text to someone new.
++var cmdSendProfile = &commands.FullHandler{
++	Name: "send-profile",
++	Func: fnSendProfile,
++	Help: commands.HelpMeta{
++		Section:     commands.HelpSectionChats,
++		Description: "Send the published name/photo to one person. Usage: `$cmdprefix send-profile <tel:+1...|mailto:...> [from-handle]`",
++	},
++	RequiresLogin: true,
++}
++
++func fnSendProfile(ce *commands.Event) {
++	args := strings.Fields(ce.RawArgs)
++	if len(args) < 1 {
++		ce.Reply("Usage: `$cmdprefix send-profile <tel:+1...|mailto:...> [from-handle]`")
++		return
++	}
++	client := commandClient(ce)
++	if client == nil {
++		return
++	}
++	target := normalizeIdentifierForPortalID(args[0])
++	from := client.getHandle()
++	if len(args) > 1 {
++		if mine := client.ownHandle(args[1]); mine != "" {
++			from = mine
++		}
++	}
++	conv := client.makeConversation([]string{from, target}, nil)
++	err := client.client.SendProfileShare(conv, from)
++	if err != nil && strings.Contains(err.Error(), "No profile published") {
++		if _, perr := publishProfile(client, "Iris"); perr != nil {
++			ce.Reply("Publishing the name/photo failed: %v", perr)
++			return
++		}
++		err = client.client.SendProfileShare(conv, from)
++	}
++	if err != nil {
++		ce.Reply("Sending the name/photo to %s failed: %v", target, err)
++		return
++	}
++	ce.Reply("Sent the name/photo to %s from %s", target, from)
++}
++
++func fnShareProfile(ce *commands.Event) {
++	args := strings.Fields(ce.RawArgs)
++	if len(args) < 1 {
++		ce.Reply("Usage: `$cmdprefix share-profile <tel:+1...|mailto:...> [display name]`")
++		return
++	}
++	target := normalizeIdentifierForPortalID(args[0])
++	name := "Iris"
++	if len(args) > 1 {
++		name = strings.Join(args[1:], " ")
++	}
++	client := commandClient(ce)
++	if client == nil {
++		return
++	}
++	hasPhoto, err := publishProfile(client, name)
++	if err != nil {
++		ce.Reply("Publishing the name/photo failed: %v", err)
++		return
++	}
++
++	var sent, failed []string
++	for _, h := range client.getAllHandles() {
++		if !strings.Contains(h, "+") {
++			continue // the plain address stays untouched (on purpose)
++		}
++		conv := client.makeConversation([]string{h, target}, nil)
++		if err := client.client.SendProfileShare(conv, h); err != nil {
++			failed = append(failed, h+": "+err.Error())
++			continue
++		}
++		sent = append(sent, h)
++	}
++	ce.Reply("Published %q (photo: %v). Shared with %s from: %s%s", name, hasPhoto, target,
++		strings.Join(sent, ", "), map[bool]string{true: "\nFailed: " + strings.Join(failed, "; "), false: ""}[len(failed) > 0])
++}
+diff --git a/pkg/connector/via_alias.go b/pkg/connector/via_alias.go
+new file mode 100755
+index 0000000..d12adbf
+--- /dev/null
++++ b/pkg/connector/via_alias.go
+@@ -0,0 +1,105 @@
++package connector
++
++// Per-bot threads.
++//
++// The Apple account has one alias address per bot (+atlas, +iris, ...).
++// A DM room is still keyed by the other person only, so all of the owner's
++// threads with the bot account share one Matrix room. What changes is which
++// of OUR handles a message goes out from:
++//
++//   - Incoming: the handle the owner addressed is found in the conversation
++//     participants. It becomes the room's current "via" and is stamped on the
++//     Matrix event as "com.atlas.via", so the right bot answers.
++//   - Outgoing: a bot puts "com.atlas.send_from" in the message content. If
++//     it's one of our registered handles, it becomes the room's via before
++//     anything is sent.
++//
++// Every send, typing indicator, read and delivery receipt for the room then
++// uses the via handle instead of the global selected handle, so on the owner's
++// iPhone each bot is its own conversation. Rooms with no via fall back to
++// the selected handle (old behaviour). Kept in memory only: after a restart
++// the next incoming message or bot send sets it again.
++
++import (
++	"sync"
++
++	"maunium.net/go/mautrix/bridgev2"
++	"maunium.net/go/mautrix/bridgev2/networkid"
++)
++
++const (
++	viaExtraKey = "com.atlas.via"
++	sendFromKey = "com.atlas.send_from"
++)
++
++var portalVia sync.Map // networkid.PortalID -> handle string
++
++// ownHandle returns the registered handle matching h (as registered), or "".
++func (c *IMClient) ownHandle(h string) string {
++	n := normalizeIdentifierForPortalID(h)
++	if n == "" {
++		return ""
++	}
++	for _, mine := range c.getAllHandles() {
++		if normalizeIdentifierForPortalID(mine) == n {
++			return mine
++		}
++	}
++	return ""
++}
++
++// viaFromParticipants finds which of our handles a conversation addresses.
++func (c *IMClient) viaFromParticipants(participants []string) string {
++	for _, p := range participants {
++		if mine := c.ownHandle(p); mine != "" {
++			return mine
++		}
++	}
++	return ""
++}
++
++func setPortalVia(portalID networkid.PortalID, handle string) {
++	if handle != "" {
++		portalVia.Store(portalID, handle)
++	}
++}
++
++// handleForPortal is the send-from handle for a room: its via if that is
++// still one of our handles, else the globally selected handle.
++func (c *IMClient) handleForPortal(portalID networkid.PortalID) string {
++	if v, ok := portalVia.Load(portalID); ok {
++		if mine := c.ownHandle(v.(string)); mine != "" {
++			return mine
++		}
++	}
++	return c.getHandle()
++}
++
++// applySendFrom reads a bot's "com.atlas.send_from" from an outgoing Matrix
++// message and makes it the room's via.
++func (c *IMClient) applySendFrom(msg *bridgev2.MatrixMessage) {
++	if msg == nil || msg.Event == nil || msg.Portal == nil {
++		return
++	}
++	raw, _ := msg.Event.Content.Raw[sendFromKey].(string)
++	if mine := c.ownHandle(raw); mine != "" {
++		setPortalVia(msg.Portal.ID, mine)
++	}
++}
++
++// tagVia stamps the addressed handle on every part of an incoming message.
++func tagVia(cm *bridgev2.ConvertedMessage, via string) *bridgev2.ConvertedMessage {
++	if cm == nil || via == "" {
++		return cm
++	}
++	for _, part := range cm.Parts {
++		if part == nil {
++			continue
++		}
++		if part.Extra == nil {
++			part.Extra = map[string]any{}
++		}
++		part.Extra[viaExtraKey] = via
++	}
++	return cm
++}
+diff --git a/pkg/rustpushgo/src/facetime_native.rs b/pkg/rustpushgo/src/facetime_native.rs
+new file mode 100755
+index 0000000..6defad1
+--- /dev/null
++++ b/pkg/rustpushgo/src/facetime_native.rs
+@@ -0,0 +1,560 @@
++//! Crew patch 2026-10-31: FaceTime audio, natively from this bridge.
++//!
++//! rustpush carries the call itself (Apple's relay, keys, SRTP) but leaves the
++//! voice codec to its caller. This is that caller: AAC-ELD through FDK in both
++//! directions, and a local socket that hands plain PCM to whoever's on the call.
++//!
++//!   127.0.0.1:8011, first line "media <guid>", then raw s16le 24 kHz mono both
++//!   ways. Bytes in get played into the call on a 20 ms clock (they queue, so
++//!   whole sentences can be written at once); bytes out are what the call hears.
++//!   Closing the socket hangs up. "flush <guid>" on the control port empties the
++//!   queue, for when someone talks over the bot.
++//!
++//! Every frame the phone sends in the first minute is also saved to
++//! data/facetime-dump-<guid>.bin as [type u8][len u16 le][bytes], so a codec
++//! mismatch can be worked out afterwards from the real thing.
++
++use fdk_aac_sys as fdk;
++use log::{info, warn};
++use rustpush::avconference::{AudioParser, AudioSender, AVSession, ChannelFrame, ChannelMessage, ChannelType};
++use rustpush::facetime::FTClient;
++use std::collections::{HashMap, VecDeque};
++use std::io::Write;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++pub(crate) const SAMPLE_RATE: u32 = 24_000;
++const FRAME_SAMPLES: usize = 480; // 20 ms at 24 kHz, what payload 104 runs at
++const BITRATE: u32 = 32_000;
++const MEDIA_PORT: u16 = 8011;
++const AOT_ELD: u32 = 39;
++const DUMP_LIMIT: usize = 4 * 1024 * 1024;
++
++// ------------------------------------------------------------------ codec ----
++
++struct Encoder(fdk::HANDLE_AACENCODER);
++unsafe impl Send for Encoder {}
++
++impl Encoder {
++    fn open(sample_rate: u32, sbr: bool, granule: u32) -> Result<(Self, Vec<u8>), String> {
++        unsafe {
++            let mut handle: fdk::HANDLE_AACENCODER = std::ptr::null_mut();
++            let check = |what: &str, code: fdk::AACENC_ERROR| {
++                if code == fdk::AACENC_ERROR_AACENC_OK { Ok(()) } else { Err(format!("{what}: {code:#x}")) }
++            };
++            check("open", fdk::aacEncOpen(&mut handle, 0, 1))?;
++            let set = |param: fdk::AACENC_PARAM, value: u32| fdk::aacEncoder_SetParam(handle, param, value);
++            check("aot", set(fdk::AACENC_PARAM_AACENC_AOT, AOT_ELD))?;
++            check("sbr", set(fdk::AACENC_PARAM_AACENC_SBR_MODE, sbr as u32))?;
++            check("rate", set(fdk::AACENC_PARAM_AACENC_SAMPLERATE, sample_rate))?;
++            check("channels", set(fdk::AACENC_PARAM_AACENC_CHANNELMODE, 1))?;
++            check("order", set(fdk::AACENC_PARAM_AACENC_CHANNELORDER, 1))?;
++            check("granule", set(fdk::AACENC_PARAM_AACENC_GRANULE_LENGTH, granule))?;
++            check("bitrate", set(fdk::AACENC_PARAM_AACENC_BITRATE, BITRATE))?;
++            check("transport", set(fdk::AACENC_PARAM_AACENC_TRANSMUX, 0))?; // raw frames
++            check("afterburner", set(fdk::AACENC_PARAM_AACENC_AFTERBURNER, 1))?;
++            check("init", fdk::aacEncEncode(handle, std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null_mut()))?;
++            let mut info: fdk::AACENC_InfoStruct = std::mem::zeroed();
++            check("info", fdk::aacEncInfo(handle, &mut info))?;
++            let config = info.confBuf[..info.confSize as usize].to_vec();
++            Ok((Encoder(handle), config))
++        }
++    }
++
++    fn encode(&mut self, pcm: &[i16]) -> Option<Vec<u8>> {
++        unsafe {
++            let mut in_ptr = pcm.as_ptr() as *mut std::ffi::c_void;
++            let mut in_id = fdk::AACENC_BufferIdentifier_IN_AUDIO_DATA as i32;
++            let mut in_size = (pcm.len() * 2) as i32;
++            let mut in_elem = 2i32;
++            let in_buf = fdk::AACENC_BufDesc {
++                numBufs: 1,
++                bufs: &mut in_ptr,
++                bufferIdentifiers: &mut in_id,
++                bufSizes: &mut in_size,
++                bufElSizes: &mut in_elem,
++            };
++            let mut out = vec![0u8; 768];
++            let mut out_ptr = out.as_mut_ptr() as *mut std::ffi::c_void;
++            let mut out_id = fdk::AACENC_BufferIdentifier_OUT_BITSTREAM_DATA as i32;
++            let mut out_size = out.len() as i32;
++            let mut out_elem = 1i32;
++            let out_buf = fdk::AACENC_BufDesc {
++                numBufs: 1,
++                bufs: &mut out_ptr,
++                bufferIdentifiers: &mut out_id,
++                bufSizes: &mut out_size,
++                bufElSizes: &mut out_elem,
++            };
++            let in_args = fdk::AACENC_InArgs { numInSamples: pcm.len() as i32, numAncBytes: 0 };
++            let mut out_args: fdk::AACENC_OutArgs = std::mem::zeroed();
++            let code = fdk::aacEncEncode(self.0, &in_buf, &out_buf, &in_args, &mut out_args);
++            if code != fdk::AACENC_ERROR_AACENC_OK {
++                return None;
++            }
++            out.truncate(out_args.numOutBytes as usize);
++            Some(out)
++        }
++    }
++}
++
++impl Drop for Encoder {
++    fn drop(&mut self) {
++        unsafe { fdk::aacEncClose(&mut self.0); }
++    }
++}
++
++struct Decoder {
++    handle: fdk::HANDLE_AACDECODER,
++    name: &'static str,
++    errors: u64,
++    frames: u64,
++}
++unsafe impl Send for Decoder {}
++
++impl Decoder {
++    fn open(config: &[u8], name: &'static str) -> Option<Self> {
++        unsafe {
++            let handle = fdk::aacDecoder_Open(fdk::TRANSPORT_TYPE_TT_MP4_RAW, 1);
++            if handle.is_null() {
++                return None;
++            }
++            let mut ptr = config.as_ptr() as *mut u8;
++            let len = config.len() as u32;
++            if fdk::aacDecoder_ConfigRaw(handle, &mut ptr, &len) != fdk::AAC_DECODER_ERROR_AAC_DEC_OK {
++                fdk::aacDecoder_Close(handle);
++                return None;
++            }
++            Some(Decoder { handle, name, errors: 0, frames: 0 })
++        }
++    }
++
++    /// One frame in, PCM out at the stream's own rate. None on a decode error.
++    fn decode(&mut self, frame: &[u8]) -> Option<(Vec<i16>, u32)> {
++        unsafe {
++            let mut ptr = frame.as_ptr() as *mut u8;
++            let size = frame.len() as u32;
++            let mut valid = size;
++            fdk::aacDecoder_Fill(self.handle, &mut ptr, &size, &mut valid);
++            let mut out = vec![0i16; 8192];
++            let code = fdk::aacDecoder_DecodeFrame(self.handle, out.as_mut_ptr(), out.len() as i32, 0);
++            self.frames += 1;
++            if code != fdk::AAC_DECODER_ERROR_AAC_DEC_OK {
++                self.errors += 1;
++                return None;
++            }
++            let info = fdk::aacDecoder_GetStreamInfo(self.handle);
++            if info.is_null() {
++                return None;
++            }
++            let info = &*info;
++            let samples = (info.frameSize * info.numChannels) as usize;
++            out.truncate(samples.min(8192));
++            let channels = info.numChannels.max(1) as usize;
++            if channels > 1 {
++                out = out.chunks(channels).map(|c| c[0]).collect();
++            }
++            Some((out, info.sampleRate as u32))
++        }
++    }
++}
++
++impl Drop for Decoder {
++    fn drop(&mut self) {
++        unsafe { fdk::aacDecoder_Close(self.handle); }
++    }
++}
++
++/// The configs Apple might be running AAC-ELD at. The first frames pick one:
++/// whichever decodes them without errors and isn't silence.
++fn decoder_candidates() -> Vec<Decoder> {
++    let configs: [(&'static str, u32, bool, u32); 5] = [
++        ("eld-24k-480", 24_000, false, 480),
++        ("eld-24k-512", 24_000, false, 512),
++        ("eld-48k-480", 48_000, false, 480),
++        ("eld-48k-sbr", 48_000, true, 480),
++        ("eld-32k-480", 32_000, false, 480),
++    ];
++    configs
++        .iter()
++        .filter_map(|(name, rate, sbr, granule)| {
++            let (_, config) = Encoder::open(*rate, *sbr, *granule).map_err(|e| warn!("FaceTime audio: no config for {name}: {e}")).ok()?;
++            info!("FaceTime audio: candidate {name} config {}", hex(&config));
++            Decoder::open(&config, name)
++        })
++        .collect()
++}
++
++fn hex(bytes: &[u8]) -> String {
++    bytes.iter().map(|b| format!("{b:02x}")).collect()
++}
++
++fn resample(pcm: &[i16], from: u32, to: u32) -> Vec<i16> {
++    if from == to || from == 0 || pcm.is_empty() {
++        return pcm.to_vec();
++    }
++    let count = pcm.len() * to as usize / from as usize;
++    (0..count)
++        .map(|i| {
++            let at = i as f64 * from as f64 / to as f64;
++            let low = at as usize;
++            let high = (low + 1).min(pcm.len() - 1);
++            let frac = at - low as f64;
++            (pcm[low] as f64 * (1.0 - frac) + pcm[high] as f64 * frac) as i16
++        })
++        .collect()
++}
++
++/// Encode a second of a tone, decode it through the same path a call uses, and
++/// report how much survived.
++pub(crate) fn codec_roundtrip() -> serde_json::Value {
++    let (mut encoder, config) = match Encoder::open(SAMPLE_RATE, false, FRAME_SAMPLES as u32) {
++        Ok(opened) => opened,
++        Err(e) => return serde_json::json!({ "ok": false, "error": e }),
++    };
++    let Some(mut decoder) = Decoder::open(&config, "roundtrip") else {
++        return serde_json::json!({ "ok": false, "error": "no decoder" });
++    };
++    let tone: Vec<i16> = (0..SAMPLE_RATE as usize * 2)
++        .map(|i| ((i as f64 * 440.0 * std::f64::consts::TAU / SAMPLE_RATE as f64).sin() * 8000.0) as i16)
++        .collect();
++    let (mut packets, mut bytes, mut decoded, mut bad) = (0u32, 0usize, Vec::new(), 0u32);
++    for chunk in tone.chunks_exact(FRAME_SAMPLES) {
++        let Some(frame) = encoder.encode(chunk) else { bad += 1; continue };
++        if frame.is_empty() {
++            continue;
++        }
++        let mut packet = vec![frame.len().min(255) as u8];
++        packet.extend_from_slice(&frame);
++        packets += 1;
++        bytes += packet.len();
++        for parsed in AudioParser(&packet) {
++            match decoder.decode(parsed) {
++                Some((pcm, _)) => decoded.extend(pcm),
++                None => bad += 1,
++            }
++        }
++    }
++    let tail = &decoded[decoded.len().saturating_sub(SAMPLE_RATE as usize)..];
++    let rms = (tail.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / tail.len().max(1) as f64).sqrt();
++    serde_json::json!({
++        "ok": bad == 0 && rms > 2000.0,
++        "config": hex(&config),
++        "packets": packets,
++        "bytes_per_packet": bytes / packets.max(1) as usize,
++        "decoded_samples": decoded.len(),
++        "bad": bad,
++        "rms": rms as u32,
++        "input_rms": (8000.0 / std::f64::consts::SQRT_2) as u32,
++    })
++}
++
++// ------------------------------------------------------------- one call ----
++
++pub(crate) struct CallAudio {
++    guid: String,
++    outgoing: Mutex<VecDeque<i16>>,
++    listener: Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>,
++    running: AtomicBool,
++    sending: AtomicBool,
++    frames_in: AtomicU64,
++    frames_out: AtomicU64,
++    dump: Mutex<Option<(std::fs::File, usize)>>,
++}
++
++static CALLS: Mutex<Option<HashMap<String, Arc<CallAudio>>>> = Mutex::new(None);
++
++fn call_audio(guid: &str) -> Option<Arc<CallAudio>> {
++    CALLS.lock().unwrap().as_ref()?.get(guid).cloned()
++}
++
++/// Wire a live native session up to the audio: frames in from now on, frames
++/// out as soon as someone else is on the line.
++pub(crate) async fn start_audio(connection: Arc<AVSession>, guid: String) {
++    let dump = std::fs::File::create(format!("facetime-dump-{guid}.bin")).ok().map(|f| (f, 0));
++    let call = Arc::new(CallAudio {
++        guid: guid.clone(),
++        outgoing: Mutex::new(VecDeque::new()),
++        listener: Mutex::new(None),
++        running: AtomicBool::new(true),
++        sending: AtomicBool::new(false),
++        frames_in: AtomicU64::new(0),
++        frames_out: AtomicU64::new(0),
++        dump: Mutex::new(dump),
++    });
++    CALLS.lock().unwrap().get_or_insert_with(HashMap::new).insert(guid.clone(), call.clone());
++
++    let incoming = call.clone();
++    let decoder: Mutex<(Vec<Decoder>, Option<Decoder>)> = Mutex::new((decoder_candidates(), None));
++    connection.frame_handler.configure_handler(Box::new(move |message| {
++        incoming.on_frame(message, &decoder);
++    }));
++
++    tokio::spawn(async move {
++        // Nobody to send to until the other side is in the relay session.
++        let started = Instant::now();
++        let peer = loop {
++            if !call.running.load(Ordering::Relaxed) || started.elapsed() > Duration::from_secs(120) {
++                return;
++            }
++            if connection.has_peer().await {
++                break true;
++            }
++            tokio::time::sleep(Duration::from_millis(100)).await;
++        };
++        if !peer {
++            return;
++        }
++        info!("FaceTime audio: someone's on {}, sending from now on", call.guid);
++        let sender = connection.create_audio_sender(2, None, &[]).await;
++        let sending = call.clone();
++        std::thread::spawn(move || sending.send_loop(sender));
++    });
++}
++
++impl CallAudio {
++    fn on_frame(&self, message: ChannelMessage, decoder: &Mutex<(Vec<Decoder>, Option<Decoder>)>) {
++        let ChannelFrame::Sample(data) = &message.frame else { return };
++        let count = self.frames_in.fetch_add(1, Ordering::Relaxed);
++        if count < 8 || count % 500 == 0 {
++            info!("FaceTime audio: in {:?} stream {} frame {count}, {} bytes: {}",
++                message.r#type, message.stream.stream_index, data.len(), hex(&data[..data.len().min(32)]));
++        }
++        self.write_dump(&message.r#type, data);
++        if !matches!(message.r#type, ChannelType::Aac | ChannelType::Aac48) {
++            return; // EVS from the phone: the dump has it, nothing here decodes it
++        }
++        let mut decoder = decoder.lock().unwrap();
++        for frame in AudioParser(data) {
++            let decoded = match &mut decoder.1 {
++                Some(chosen) => chosen.decode(frame),
++                None => {
++                    // Try every candidate on the same frame until one holds.
++                    let (candidates, _) = &mut *decoder;
++                    let mut result = None;
++                    let mut pick = None;
++                    for (i, candidate) in candidates.iter_mut().enumerate() {
++                        if let Some(output) = candidate.decode(frame) {
++                            let loud = output.0.iter().any(|s| s.unsigned_abs() > 8);
++                            if candidate.frames >= 25 && candidate.errors * 5 <= candidate.frames && loud {
++                                info!("FaceTime audio: decoding as {} at {} Hz, {} of {} frames bad",
++                                    candidate.name, output.1, candidate.errors, candidate.frames);
++                                pick = Some(i);
++                                result = Some(output);
++                                break;
++                            }
++                        }
++                    }
++                    if let Some(i) = pick {
++                        let chosen = decoder.0.swap_remove(i);
++                        decoder.1 = Some(chosen);
++                        decoder.0.clear();
++                    }
++                    result
++                }
++            };
++            let Some((pcm, rate)) = decoded else { continue };
++            let pcm = resample(&pcm, rate, SAMPLE_RATE);
++            let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
++            if let Some(listener) = self.listener.lock().unwrap().as_ref() {
++                let _ = listener.send(bytes);
++            }
++        }
++    }
++
++    fn write_dump(&self, kind: &ChannelType, data: &[u8]) {
++        let mut dump = self.dump.lock().unwrap();
++        let Some((file, written)) = dump.as_mut() else { return };
++        if *written > DUMP_LIMIT {
++            return;
++        }
++        let tag = match kind {
++            ChannelType::Evs => 1u8,
++            ChannelType::Aac => 2,
++            ChannelType::Aac48 => 3,
++            _ => return,
++        };
++        let _ = file.write_all(&[tag]);
++        let _ = file.write_all(&(data.len() as u16).to_le_bytes());
++        let _ = file.write_all(data);
++        *written += 3 + data.len();
++    }
++
++    /// 20 ms clock: whatever's queued goes out, silence otherwise, so the far
++    /// end always hears a live stream.
++    fn send_loop(self: Arc<Self>, mut sender: AudioSender) {
++        let (mut encoder, config) = match Encoder::open(SAMPLE_RATE, false, FRAME_SAMPLES as u32) {
++            Ok(opened) => opened,
++            Err(e) => {
++                warn!("FaceTime audio: no encoder: {e}");
++                return;
++            }
++        };
++        info!("FaceTime audio: sending AAC-ELD, config {}", hex(&config));
++        self.sending.store(true, Ordering::Relaxed);
++        let mut next = Instant::now();
++        let mut timestamp: u32 = rand::random::<u32>() & 0x00ff_ffff;
++        let mut pcm = [0i16; FRAME_SAMPLES];
++        while self.running.load(Ordering::Relaxed) {
++            {
++                let mut queue = self.outgoing.lock().unwrap();
++                for slot in pcm.iter_mut() {
++                    *slot = queue.pop_front().unwrap_or(0);
++                }
++            }
++            if let Some(frame) = encoder.encode(&pcm) {
++                if !frame.is_empty() {
++                    // [size][frame], the same shape AudioParser reads coming in
++                    let mut packet = Vec::with_capacity(frame.len() + 1);
++                    packet.push(frame.len().min(255) as u8);
++                    packet.extend_from_slice(&frame);
++                    match sender.send_audio_frame(&packet, timestamp) {
++                        Ok(()) => {
++                            let sent = self.frames_out.fetch_add(1, Ordering::Relaxed);
++                            if sent < 3 || sent % 500 == 0 {
++                                info!("FaceTime audio: out frame {sent}, {} bytes", packet.len());
++                            }
++                        }
++                        Err(e) => warn!("FaceTime audio: send failed: {e:?}"),
++                    }
++                }
++            }
++            timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
++            next += Duration::from_millis(20);
++            let now = Instant::now();
++            if next > now {
++                std::thread::sleep(next - now);
++            } else if now - next > Duration::from_millis(200) {
++                next = now; // fell behind (a stall): don't burst to catch up
++            }
++        }
++        info!("FaceTime audio: {} stopped after {} frames in, {} out", self.guid,
++            self.frames_in.load(Ordering::Relaxed), self.frames_out.load(Ordering::Relaxed));
++    }
++
++    pub(crate) fn stats(&self) -> serde_json::Value {
++        serde_json::json!({
++            "frames_in": self.frames_in.load(Ordering::Relaxed),
++            "frames_out": self.frames_out.load(Ordering::Relaxed),
++            "sending": self.sending.load(Ordering::Relaxed),
++            "queued_ms": self.outgoing.lock().unwrap().len() as u64 * 1000 / SAMPLE_RATE as u64,
++        })
++    }
++
++    fn stop(&self) {
++        self.running.store(false, Ordering::Relaxed);
++        *self.listener.lock().unwrap() = None;
++    }
++}
++
++pub(crate) fn audio_stats(guid: &str) -> Option<serde_json::Value> {
++    Some(call_audio(guid)?.stats())
++}
++
++pub(crate) fn flush_audio(guid: &str) -> bool {
++    match call_audio(guid) {
++        Some(call) => {
++            call.outgoing.lock().unwrap().clear();
++            true
++        }
++        None => false,
++    }
++}
++
++pub(crate) fn stop_audio(guid: &str) {
++    if let Some(calls) = CALLS.lock().unwrap().as_mut() {
++        if let Some(call) = calls.remove(guid) {
++            call.stop();
++        }
++    }
++}
++
++// ----------------------------------------------------------- media socket ----
++
++static MEDIA_STARTED: std::sync::Once = std::sync::Once::new();
++
++pub(crate) fn start_media_port(facetime: fn() -> Option<Arc<FTClient>>) {
++    MEDIA_STARTED.call_once(|| {
++        tokio::spawn(async move {
++            let listener = match tokio::net::TcpListener::bind(("127.0.0.1", MEDIA_PORT)).await {
++                Ok(listener) => listener,
++                Err(e) => {
++                    warn!("FaceTime media port {MEDIA_PORT} didn't open: {e}");
++                    return;
++                }
++            };
++            info!("FaceTime media port open on {MEDIA_PORT}");
++            loop {
++                let Ok((stream, _)) = listener.accept().await else { continue };
++                tokio::spawn(media_connection(stream, facetime));
++            }
++        });
++    });
++}
++
++async fn media_connection(stream: tokio::net::TcpStream, facetime: fn() -> Option<Arc<FTClient>>) {
++    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
++    let _ = stream.set_nodelay(true);
++    let (read, mut write) = stream.into_split();
++    let mut reader = tokio::io::BufReader::new(read);
++    let mut line = String::new();
++    if !matches!(tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line)).await, Ok(Ok(n)) if n > 0) {
++        return;
++    }
++    let Some(guid) = line.trim().strip_prefix("media ").map(str::to_string) else { return };
++    let Some(call) = call_audio(&guid) else {
++        let _ = write.write_all(b"no such call\n").await;
++        return;
++    };
++    info!("FaceTime media: socket attached to {guid}");
++    let _ = write.write_all(b"ok\n").await;
++
++    // call -> socket
++    let (to_socket, from_call) = std::sync::mpsc::channel::<Vec<u8>>();
++    *call.listener.lock().unwrap() = Some(to_socket);
++    let (bytes_out, mut bytes_in) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
++    std::thread::spawn(move || {
++        while let Ok(bytes) = from_call.recv() {
++            if bytes_out.send(bytes).is_err() {
++                break;
++            }
++        }
++    });
++    let writer = tokio::spawn(async move {
++        while let Some(bytes) = bytes_in.recv().await {
++            if write.write_all(&bytes).await.is_err() {
++                break;
++            }
++        }
++    });
++
++    // socket -> call
++    let mut buffer = vec![0u8; 8192];
++    let mut leftover: Option<u8> = None;
++    loop {
++        match reader.read(&mut buffer).await {
++            Ok(0) | Err(_) => break,
++            Ok(n) => {
++                let mut bytes = &buffer[..n];
++                let mut queue = call.outgoing.lock().unwrap();
++                if let (Some(low), Some(high)) = (leftover, bytes.first()) {
++                    queue.push_back(i16::from_le_bytes([low, *high]));
++                    leftover = None;
++                    bytes = &bytes[1..];
++                }
++                let chunks = bytes.chunks_exact(2);
++                leftover = chunks.remainder().first().copied();
++                for chunk in chunks {
++                    queue.push_back(i16::from_le_bytes([chunk[0], chunk[1]]));
++                }
++            }
++        }
++    }
++    info!("FaceTime media: socket closed, hanging up {guid}");
++    writer.abort();
++    *call.listener.lock().unwrap() = None;
++    if let Some(facetime) = facetime() {
++        crate::facetime_notify::hang_up(&facetime, &guid).await;
++    }
++}

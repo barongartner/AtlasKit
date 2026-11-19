@@ -1,0 +1,48 @@
+# secrets and runtime state (any bot folder)
+.env
+*/.env
+Shared/.env
+*.log
+*.lock
+session_id.txt
+session_day.txt
+imessage_state.json
+*.tmp
+status.json
+usage.json
+stop.flag
+__pycache__/
+
+# the bridge's hardware identity, if a copy ever lands in the kit
+hardware-key.json
+hardware-key.b64
+
+# incoming media and saved clips
+Inbox/
+**/Library/Reels/
+**/Library/Clips/
+
+# inter-bot message bus (runtime chatter, plus its readable log)
+Bus/
+
+# per-person conversation logs: PC only, never backed up
+**/Memories/People/
+Iris/Memories/People/
+
+Iris/Memories/Availability.md
+Iris/Pics/
+
+# Iris texts queued for later (messages to real people)
+Iris/scheduled_texts*.json
+
+# rotated logs (atlas.log.1 and friends): *.log above does not match them
+*.log.*
+
+# the desktop app's browser profile: cache, cookies, crash dumps
+App/WebView Data/
+
+# browser automation page snapshots
+.playwright-mcp/
+
+# My planning notes, never shipped
+PLAN.md

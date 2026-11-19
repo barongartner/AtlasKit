@@ -1,0 +1,450 @@
+diff --git a/src/auth.rs b/src/auth.rs
+index e8e7f7b..97963bf 100644
+--- a/src/auth.rs
++++ b/src/auth.rs
+@@ -399,38 +399,57 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
+         }
+     };
+ 
+-    let validation_data = os_config.generate_validation_data().await?;
+-
+-    let base_headers = account.anisette.lock().await.get_headers().await?.clone();
+-    let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
+-
+-    if let Some(cookie) = cookie {
+-        anisette_headers.insert("Cookie", HeaderValue::from_str(cookie).unwrap());
+-    }
+-
+-    let resp = REQWEST.post(os_config.get_login_url())
+-            .header("Accept-Encoding", "gzip")
+-            .header("User-Agent", os_config.get_normal_ua("com.apple.iCloudHelper/282"))
+-            .header("X-Mme-Client-Info", os_config.get_mme_clientinfo(&os_config.get_aoskit_version()))
+-            .header("X-Mme-Nas-Qualify", base64_encode(&validation_data))
+-            .header("X-Apple-ADSID", adsid)
+-            .headers(anisette_headers.clone())
+-            .basic_auth(username, Some(pet))
+-            .body(plist_to_string(&request)?)
+-            .send()
+-            .await?;
+-    let text = resp.text().await?;
+-
+-    let parsed = plist::Value::from_reader(Cursor::new(text.as_str()))?;
+-    let parsed_dict = parsed.as_dictionary().unwrap();
++    // 2026-10 -80045 workaround: GSA now gets Windows client info. A PET from a fresh 2FA
++    // worked here with Mac client info (Oct 17, 12:18); PETs from 2FA-less logins came back
++    // UNAUTHORIZED. Try Mac first, then Windows (anisette-v3-server#61). This endpoint is not
++    // behind the GSA throttle, so the second try is cheap.
++    let client_infos = [
++        os_config.get_mme_clientinfo(&os_config.get_aoskit_version()),
++        "<PC> <Windows;6.2(0,0);9200> <com.apple.AOSKit/282 (com.apple.iCloud/7.21)>".to_string(),
++    ];
++    let mut parsed = None;
++    for (i, client_info) in client_infos.iter().enumerate() {
++        let validation_data = os_config.generate_validation_data().await?;
++
++        let base_headers = account.anisette.lock().await.get_headers().await?.clone();
++        let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
++
++        if let Some(cookie) = cookie {
++            anisette_headers.insert("Cookie", HeaderValue::from_str(cookie).unwrap());
++        }
+ 
+-    if let Some(error) = parsed_dict.get("localizedError") {
+-        let error = error.as_string().unwrap();
+-        if error == "UNAUTHORIZED" {
+-            return Err(PushError::UnauthorizedAccountError);
++        let resp = REQWEST.post(os_config.get_login_url())
++                .header("Accept-Encoding", "gzip")
++                .header("User-Agent", os_config.get_normal_ua("com.apple.iCloudHelper/282"))
++                .header("X-Mme-Client-Info", client_info.as_str())
++                .header("X-Mme-Nas-Qualify", base64_encode(&validation_data))
++                .header("X-Apple-ADSID", adsid.clone())
++                .headers(anisette_headers.clone())
++                .basic_auth(username.clone(), Some(pet.clone()))
++                .body(plist_to_string(&request)?)
++                .send()
++                .await?;
++        let text = resp.text().await?;
++
++        let value = plist::Value::from_reader(Cursor::new(text.as_str()))?;
++        let value_dict = value.as_dictionary().unwrap();
++
++        if let Some(error) = value_dict.get("localizedError") {
++            let error = error.as_string().unwrap();
++            if error == "UNAUTHORIZED" {
++                if i + 1 < client_infos.len() {
++                    warn!("loginDelegates UNAUTHORIZED with {}, retrying with {}", client_info, client_infos[i + 1]);
++                    continue;
++                }
++                return Err(PushError::UnauthorizedAccountError);
++            }
++            return Err(PushError::MobileMeError(error.to_string(), value_dict.get("description").and_then(|d| d.as_string().map(|s| s.to_string()))));
+         }
+-        return Err(PushError::MobileMeError(error.to_string(), parsed_dict.get("description").and_then(|d| d.as_string().map(|s| s.to_string()))));
++        parsed = Some(value);
++        break;
+     }
++    let parsed = parsed.expect("loop returns or sets parsed");
++    let parsed_dict = parsed.as_dictionary().unwrap();
+ 
+     if parsed_dict.get("status").unwrap().as_unsigned_integer().unwrap() != 0 {
+         return Err(PushError::AuthError(parsed.clone()));
+diff --git a/src/avconference.rs b/src/avconference.rs
+index 0fea749..1906550 100644
+--- a/src/avconference.rs
++++ b/src/avconference.rs
+@@ -3766,7 +3766,8 @@ impl AudioSender {
+                 padding: false,
+                 extension: self.is_u1,
+                 marker: self.is_first,
+-                payload_type: 108,
++                // Crew patch: AAC-ELD, the codec we've got on Linux (see below).
++                payload_type: 104,
+                 sequence_number: self.sequence_number,
+                 timestamp,
+                 ssrc: self.ssrc,
+@@ -4105,6 +4106,11 @@ impl AVSession {
+         Ok(())
+     }
+ 
++    // Crew patch: is anyone else on the relay yet? create_audio_sender needs it.
++    pub async fn has_peer(&self) -> bool {
++        !self.state.lock().await.active_participants.is_empty()
++    }
++
+     pub async fn create_audio_sender(&self, group: u32, stream: Option<u32>, extra_streams: &[u32]) -> AudioSender {
+         let state = self.state.lock().await;
+ 
+@@ -5627,9 +5633,8 @@ impl AVConfig {
+                     VcMediaNegotiationBlobV2StreamGroup {
+                         stream_group: Some(2),
+                         payloads: vec![
+-                            VcMediaNegotiationBlobV2StreamGroupPayload { rtp_payload: Some(108), ..Default::default() },
+-                            VcMediaNegotiationBlobV2StreamGroupPayload { rtp_payload: Some(13), ..Default::default() },
+                             VcMediaNegotiationBlobV2StreamGroupPayload { rtp_payload: Some(104), ..Default::default() },
++                            VcMediaNegotiationBlobV2StreamGroupPayload { rtp_payload: Some(13), ..Default::default() },
+                         ],
+                         streams: vec![
+                             VcMediaNegotiationBlobV2StreamGroupStream {
+@@ -5809,7 +5814,9 @@ impl AVConfig {
+                 // flag 8  -> payload 20   side/aux
+                 // flag 64 -> payload 101
+                 // default 0b1111
+-                payloads: Some(0b1111),
++                // Crew patch: AAC-ELD and comfort noise only. Nothing here can
++                // decode EVS, so a phone must never pick it for us.
++                payloads: Some(0b0101),
+                 cipher_suites: Some(5),
+             }),
+             camera_u1: Some(VcMediaNegotiationBlobV2CameraSettingsU1 {
+diff --git a/src/facetime.rs b/src/facetime.rs
+index de90bc9..7830fc3 100644
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -200,6 +200,10 @@ pub struct FTSession {
+     // than a false negative, which we avoid at this time.
+     #[serde(skip)]
+     pub is_initiator: bool,
++    // Crew patch (Atlas FaceTime): joined with signaling only, to hold a
++    // ringing call open until a web client joins and carries the media.
++    #[serde(skip)]
++    pub is_propped: bool,
+ }
+ 
+ impl Default for FTSession {
+@@ -221,6 +225,7 @@ impl Default for FTSession {
+             connection: Default::default(),
+             av_config: AVConfig::new(),
+             is_initiator: Default::default(),
++            is_propped: false,
+         }
+     }
+ }
+@@ -840,6 +845,22 @@ impl FTClient {
+         Ok(())
+     }
+ 
++    // Crew patch: how many of `target`'s devices a FaceTime message from
++    // `handle` can reach. Zero means Apple gave us no keys for them.
++    pub async fn key_count(&self, handle: &str, target: &str, refresh: bool) -> Result<usize, PushError> {
++        let topic = "com.apple.private.alloy.facetime.multi";
++        let targets = [target.to_string()];
++        self.identity.cache_keys(
++            topic,
++            &targets,
++            handle,
++            refresh,
++            &QueryOptions { required_for_message: true, result_expected: true }
++        ).await?;
++        let found = self.identity.cache.lock().await.get_participants_targets(&topic, handle, &targets).len();
++        Ok(found)
++    }
++
+     // group is random uuid
+     pub async fn create_session(&self, for_group: String, handle: String, participants: &[String], is_video: bool) -> Result<(), PushError> {
+         let since_the_epoch = duration_since_epoch();
+@@ -861,6 +882,7 @@ impl FTClient {
+             connection: None,
+             av_config: AVConfig::new(),
+             is_initiator: true,
++            is_propped: false,
+ 
+             is_video,
+         };
+@@ -960,7 +982,25 @@ impl FTClient {
+     pub async fn join(&self, session: &mut FTSession, ring: bool) -> Result<(), PushError> {
+         info!("joining conversation");
+ 
+-        self.connect_to_relay(session, &[]).await?;
++        // Crew patch (Atlas FaceTime): a client that never set local
++        // interfaces has no media stack, so this join is the pre-ad4265a
++        // prop_up_conv: signaling only, holding a ringing call open until a
++        // web client joins (the 207 handler unprops when it does). Apple's
++        // quickrelay push that comes with the ring already gave this device
++        // a participant id; ask for an allocation only if it didn't.
++        let prop_only = self.interfaces.read().await.is_none();
++        if prop_only {
++            if session.get_participant(self.conn.get_token().await).is_none() {
++                let my_handle = session.my_handles.first().ok_or(PushError::NoHandle)?.clone();
++                let people: Vec<String> = session.members.iter().map(|m| m.handle.clone()).collect();
++                let allocations = self.identity.request_relay_allocations(&my_handle, &people, &session.group_id).await?;
++                session.import_allocations(&allocations);
++            }
++            session.is_initiator = true; // what the old prop always sent
++            info!("propping conversation {} (signaling only)", session.group_id);
++        } else {
++            self.connect_to_relay(session, &[]).await?;
++        }
+         let handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
+         // we are picking up a call (the prop isn't to ring, and we are ringing)
+         if !ring && session.is_ringing_inaccurate {
+@@ -1099,7 +1139,9 @@ impl FTClient {
+             ]),
+         }, targets).await?;
+ 
+-        
++        if prop_only {
++            session.is_propped = true;
++        }
+         Ok(())
+     }
+ 
+@@ -1193,6 +1235,7 @@ impl FTClient {
+         let base64_encoded = Some(base64_encode(&self.conn.get_token().await));
+         let my_participant = session.participants.values_mut().find(|p| &p.token == &base64_encoded).ok_or(PushError::NoParticipantTokenIndex)?;
+         my_participant.active = None; // we left, remember?
++        session.is_propped = false;
+ 
+         Ok(())
+     }
+@@ -1629,6 +1672,16 @@ impl FTClient {
+                         active: Some(participant_from_meta(participant, &sender, avc_data.into(), message, &decoded_context)),
+                     });
+ 
++                    // Crew patch (Atlas FaceTime): a web client joined the call
++                    // we were holding open, so it carries the call from here
++                    // (the pre-ad4265a unprop).
++                    if session.is_propped && sender.starts_with("temp:") {
++                        info!("web client joined {}, unpropping", session.group_id);
++                        if let Err(e) = self.leave(session).await {
++                            warn!("unprop failed for {}: {e:?}", session.group_id);
++                        }
++                    }
++
+                     if message.r#type() == ConversationMessageType::Invitation {
+                         if sender != target {
+                             session.mode = Some(FTMode::Incoming)
+diff --git a/src/icloud/keychain.rs b/src/icloud/keychain.rs
+index c8afb85..19e29e1 100644
+--- a/src/icloud/keychain.rs
++++ b/src/icloud/keychain.rs
+@@ -1626,7 +1626,16 @@ impl<P: AnisetteProvider> KeychainClient<P> {
+                 modified = true;
+             }
+ 
++            let my_id = &state.user_identity.as_ref().unwrap().identifier;
+             for excluded in &trust.excludeds {
++                if excluded == my_id {
++                    warn!(
++                        "Ignoring exclusion of ourselves ({}) from peer {}",
++                        excluded,
++                        peer.0.hash.as_ref().unwrap()
++                    );
++                    continue;
++                }
+                 if current_state.excludeds.contains(excluded) { continue }
+                 if current_state.includeds.contains(excluded) {
+                     current_state.includeds.retain(|a| a != excluded);
+diff --git a/src/ids/user.rs b/src/ids/user.rs
+index f097b8b..3345dc6 100644
+--- a/src/ids/user.rs
++++ b/src/ids/user.rs
+@@ -1105,7 +1105,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
+         ("validation-data", Value::Data(config.generate_validation_data().await?))
+     ].into_iter()));
+ 
+-    let mut request = SignedRequest::new("id-register", Method::POST)
++    if std::env::var("RUSTPUSH_LOG_REGISTER_BODY").is_ok() { info!("REGISTER body XML: {}", plist_to_string(&body).unwrap_or_default()); } let mut request = SignedRequest::new("id-register", Method::POST)
+             .header("x-push-token", &base64_encode(&aps.token.ok_or(PushError::APSNotReady("token"))?))
+             .header("x-protocol-version", &config.get_protocol_version().to_string())
+             .header("user-agent", &format!("com.apple.invitation-registration {}", config.get_version_ua()))
+diff --git a/src/imessage/messages.rs b/src/imessage/messages.rs
+index 376eb98..5e93f24 100644
+--- a/src/imessage/messages.rs
++++ b/src/imessage/messages.rs
+@@ -91,6 +91,50 @@ impl TextFlags {
+     }
+ }
+ 
++// Capture mode (Atlas, 2026-11-17). To send sticker tapbacks and Apple's
++// special link cards (YouTube, Music, Maps, App Store) the bridge has to copy
++// exactly what an iPhone sends, and nothing documents that format. While
++// ~/imessage-bridge/state/capture-on exists, every incoming sticker tapback and
++// every link card with a specialization (or one that fails to parse) is saved
++// as an XML plist in ~/imessage-bridge/captures/. Data blobs over 4 KB (the
++// pictures) are replaced by their size, so it's text only. Off by default;
++// delete the flag file and the folder when done.
++fn atlas_capture(kind: &str, value: &Value) {
++    let home = std::env::var("HOME").unwrap_or_default();
++    if home.is_empty() || !std::path::Path::new(&format!("{home}/imessage-bridge/state/capture-on")).exists() {
++        return;
++    }
++    fn shrink(v: &Value) -> Value {
++        match v {
++            Value::Data(d) if d.len() > 4096 => Value::String(format!("<{} bytes of data, not kept>", d.len())),
++            Value::Data(d) => {
++                // Small blobs are often nested binary plists or archives: keep them readable.
++                match plist::Value::from_reader(Cursor::new(d)) {
++                    Ok(inner) if !matches!(inner, Value::Data(_)) => {
++                        let mut wrap = Dictionary::new();
++                        wrap.insert("__nested_plist__".to_string(), shrink(&inner));
++                        Value::Dictionary(wrap)
++                    }
++                    _ => v.clone(),
++                }
++            }
++            Value::Array(a) => Value::Array(a.iter().map(shrink).collect()),
++            Value::Dictionary(d) => Value::Dictionary(d.iter().map(|(k, v)| (k.clone(), shrink(v))).collect()),
++            other => other.clone(),
++        }
++    }
++    let dir = format!("{home}/imessage-bridge/captures");
++    if std::fs::create_dir_all(&dir).is_err() {
++        return;
++    }
++    let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
++    let path = format!("{dir}/{kind}-{ms}.plist");
++    match shrink(value).to_file_xml(&path) {
++        Ok(()) => info!("Captured {} to {}", kind, path),
++        Err(e) => warn!("Capture of {} failed: {}", kind, e),
++    }
++}
++
+ #[derive(Clone, Copy, Serialize, Deserialize)]
+ pub enum TextEffect {
+     Big = 5,
+@@ -2265,7 +2309,10 @@ impl MessageInst {
+                             balloon_part = Some(gzip(&BaseBalloonBody {
+                                 attachments: link_meta.attachments.clone().into_iter().map(|i| i.into()).collect(),
+                                 payload: plist_to_bin(&KeyedArchive::archive_item(plist::to_value(&RichLink {
+-                                    rich_link_is_placeholder: true,
++                                    // An iPhone first sends a placeholder (link only) and then the
++                                    // finished card. With a picture attached ours is the finished
++                                    // card, so say so; without one, keep what always worked.
++                                    rich_link_is_placeholder: link_meta.attachments.is_empty(),
+                                     rich_link_metadata: link_meta.data.clone(),
+                                 })?)?)?.into(),
+                             }.to_bin()?)?);
+@@ -2720,6 +2767,7 @@ impl MessageInst {
+                     }
+                 },
+                 2007 | 3007 => {
++                    atlas_capture("sticker-tapback", &value);
+                     let Some(xml) = &loaded.xml else {
+                         return Err(PushError::BadMsg)
+                     };
+@@ -2840,6 +2888,21 @@ impl MessageInst {
+                 embedded_profile: None,
+             }))
+         }
++        // Capture mode: app balloons other than link cards (live location,
++        // Find My, polls, games), stickers sent as their own message (sticker
++        // attributes in the XML), and bubbles that are only an object
++        // placeholder with no file (live location shows up like that).
++        if let Some(d) = value.as_dictionary() {
++            let bid = d.get("bid").and_then(|v| v.as_string()).unwrap_or("");
++            let xml = d.get("x").and_then(|v| v.as_string()).unwrap_or("");
++            let text = d.get("t").and_then(|v| v.as_string()).unwrap_or("");
++            if (!bid.is_empty() && bid != "com.apple.messages.URLBalloonProvider")
++                || xml.contains("spw=") || xml.to_lowercase().contains("sticker")
++                || (text.contains('\u{FFFC}') && !xml.contains("FILE"))
++            {
++                atlas_capture("message", &value);
++            }
++        }
+         if let Ok(loaded) = plist::from_value::<RawIMessage>(&value) {
+             let replies = loaded.reply.as_ref().map(|to| {
+                 let mut parts: Vec<&str> = to.split(":").collect();
+@@ -2887,7 +2950,21 @@ impl MessageInst {
+                     debug!("a");
+                     let unpacked = BaseBalloonBody::from_bin(ungzip(&balloon_part)?);
+                     debug!("b");
+-                    let payload: RichLink = plist::from_value(&KeyedArchive::expand_root(unpacked.payload.as_ref())?)?;
++                    let expanded = KeyedArchive::expand_root(unpacked.payload.as_ref())?;
++                    let parsed = plist::from_value::<RichLink>(&expanded);
++                    let special = expanded.as_dictionary()
++                        .and_then(|d| d.get("richLinkMetadata"))
++                        .and_then(|m| m.as_dictionary())
++                        .map_or(false, |m| m.contains_key("specialization2") || m.contains_key("specialization"));
++                    if special || parsed.is_err() {
++                        let mut both = Dictionary::new();
++                        both.insert("expanded".to_string(), expanded.clone());
++                        if let Ok(raw) = plist::Value::from_reader(Cursor::new(unpacked.payload.as_ref())) {
++                            both.insert("archive".to_string(), raw);
++                        }
++                        atlas_capture("richlink", &Value::Dictionary(both));
++                    }
++                    let payload: RichLink = parsed?;
+                     debug!("c");
+                     Ok::<_, PushError>((unpacked, payload))
+                 })() {
+diff --git a/src/lib.rs b/src/lib.rs
+index 0b64545..587db26 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,11 +1,11 @@
+ 
+-mod activation;
++pub mod activation;
+ mod aps;
+ mod util;
+ mod imessage;
+ mod error;
+ mod auth;
+-mod ids;
++pub mod ids;
+ pub mod avconference;
+ pub mod sharedstreams;
+ pub mod findmy;
+diff --git a/src/statuskit.rs b/src/statuskit.rs
+index a8fe25d..c9d3e90 100644
+--- a/src/statuskit.rs
++++ b/src/statuskit.rs
+@@ -116,7 +116,7 @@ pub struct StatusKitState {
+ impl StatusKitState {
+     fn build_aps_message_for(&self, channel: &APSChannelIdentifier, join: bool) -> APSChannel {
+         let Some(recent) = self.recent_channels.iter().find(|c| &c.identifier == channel) else {
+-            panic!("No saved channel for identifier!")
++            warn!("StatusKit: no saved channel for identifier — using last_msg_ns=0 (will replay)"); return APSChannel { identifier: channel.clone(), last_msg_ns: 0, subscribe: join };
+         };
+ 
+         APSChannel {
+@@ -733,7 +733,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
+                 let Some(channel) = &channel else { return Ok(None) };
+                 debug!("Got statuskit message {inner:?} on channel {}", encode_hex(&channel.id));
+                 let mut state = self.state.write().await;
+-                let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { panic!("Channel not found!") };
++                let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { warn!("StatusKit: presence msg arrived before keysharing for channel={} — dropping", encode_hex(&channel.id)); return Ok(None); };
+ 
+                 let key = referenced_channel.get_key(inner.ratchet)?;
+ 

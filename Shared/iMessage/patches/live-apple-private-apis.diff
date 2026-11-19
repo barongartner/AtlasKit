@@ -1,0 +1,258 @@
+diff --git a/icloud-auth/src/anisette.rs b/icloud-auth/src/anisette.rs
+index d1ed4fb..939aabf 100644
+--- a/icloud-auth/src/anisette.rs
++++ b/icloud-auth/src/anisette.rs
+@@ -25,7 +25,7 @@ impl AnisetteData {
+                 ("X-Apple-AK-Context-Type", self.client_info.ak_context_type.as_str()),
+                 ("X-Apple-Client-App-Name", &self.client_info.client_app_name),
+                 ("X-Apple-I-Client-Bundle-Id", &self.client_info.client_bundle_id),
+-                ("X-MMe-Client-Info", &self.client_info.mme_client_info_akd),
++                ("X-MMe-Client-Info", "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iCloud/7.21)>"), // 2026-10 -80045 workaround: GsService2 rejects Mac client info
+                 ("Accept-Language", "en-US,en;q=0.9"),
+                 ("User-Agent", &self.client_info.akd_user_agent),
+             ].into_iter().map(|(a, b)| (a.to_string(), b.to_string())))
+diff --git a/icloud-auth/src/client.rs b/icloud-auth/src/client.rs
+index 34591f0..b7aa338 100644
+--- a/icloud-auth/src/client.rs
++++ b/icloud-auth/src/client.rs
+@@ -134,8 +134,8 @@ impl PersistAccountData {
+ 
+ #[derive(Serialize, Deserialize)]
+ pub struct FetchedToken {
+-    token: String,
+-    expiration: SystemTime,
++    pub token: String,
++    pub expiration: SystemTime,
+ }
+ 
+ pub struct AppleAccount<T: AnisetteProvider> {
+@@ -263,6 +263,25 @@ async fn parse_response(res: Result<Response, reqwest::Error>) -> Result<plist::
+ 
+ impl<T: AnisetteProvider> AppleAccount<T> {
+ 
++    // One GsService2 POST. Since the Oct 2026 -80045 change it sometimes answers with an
++    // HTML 503 page instead of a plist; that shows up here as a parse error, logged with the body.
++    // No retry in here: the request embeds one-time anisette data that goes stale within a
++    // minute, so a retry must rebuild the whole request (see login_email_pass).
++    async fn gsa_post(&self, headers: &HeaderMap, body: &str) -> Result<plist::Dictionary, crate::Error> {
++        let res = self.client.post(GSA_ENDPOINT).headers(headers.clone()).body(body.to_string()).send().await?;
++        let status = res.status();
++        let text = res.text().await?;
++        if !text.trim_start().starts_with("<?xml") && !text.trim_start().starts_with("<plist") {
++            let snippet: String = text.chars().take(400).collect();
++            warn!("GSA HTTP {} non-plist body: {}", status, snippet.replace('\n', " "));
++        }
++        let res: plist::Dictionary = plist::from_bytes(text.as_bytes())?;
++        match res.get("Response").cloned() {
++            Some(plist::Value::Dictionary(dict)) => Ok(dict),
++            _ => Err(crate::Error::Parse),
++        }
++    }
++
+     pub fn new_with_anisette(client_info: LoginClientInfo, anisette:  ArcAnisetteClient<T>, persisted: Option<PersistAccountData>, update_persist: Box<dyn FnMut(&PersistAccountData) + Send + Sync>) -> Result<Self, crate::Error> {
+         let client = ClientBuilder::new()
+             .cookie_store(true)
+@@ -271,6 +290,10 @@ impl<T: AnisetteProvider> AppleAccount<T> {
+             // .danger_accept_invalid_certs(true)
+             .http1_title_case_headers()
+             .connection_verbose(true)
++            // Don't reuse idle connections: Apple closes them while the user types the 2FA
++            // code, and the reused socket failed verify with "connection closed before message
++            // completed" (Oct 17). A fresh connection per request costs nothing here.
++            .pool_max_idle_per_host(0)
+             .build()?;
+ 
+         Ok(AppleAccount {
+@@ -679,58 +702,109 @@ impl<T: AnisetteProvider> AppleAccount<T> {
+         Ok(LoginState::LoggedIn)
+     }
+ 
++    // Apple's throttle can 503 either SRP leg (init or complete); a 503 on complete kills the
++    // SRP session, so start the whole login over with fresh anisette after a quiet wait.
++    // GSA_RETRY_SECS / GSA_RETRY_MAX tune it (default 5 min x 8); login.sh uses 45 min x 12
++    // so the owner can type the password once and walk away while a long block wears off.
+     pub async fn login_email_pass(
+         &mut self,
+         username: &str,
+         hashed_password: &[u8],
++    ) -> Result<LoginState, Error> {
++        // Crew patch: a background login that doesn't finish (locked, needs 2FA,
++        // refused) blocks the others for 6 hours, across restarts. Dozens of these a
++        // day got the account locked on 2026-10-24. Interactive logins skip this.
++        let interactive = std::env::var_os("GSA_INTERACTIVE").is_some();
++        let backoff = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("imessage-bridge/state/gsa-backoff");
++        if !interactive {
++            let recent = std::fs::metadata(&backoff).and_then(|m| m.modified()).ok()
++                .and_then(|t| t.elapsed().ok()).is_some_and(|age| age < Duration::from_secs(6 * 3600));
++            if recent {
++                warn!("Skipping the Apple login: the last one failed less than 6 hours ago");
++                return Err(Error::AuthSrp);
++            }
++        }
++        let result = self.login_email_pass_retrying(username, hashed_password).await;
++        if !interactive {
++            if matches!(result, Ok(LoginState::LoggedIn)) {
++                let _ = std::fs::remove_file(&backoff);
++            } else {
++                let _ = std::fs::write(&backoff, b"");
++            }
++        }
++        result
++    }
++
++    async fn login_email_pass_retrying(
++        &mut self,
++        username: &str,
++        hashed_password: &[u8],
++    ) -> Result<LoginState, Error> {
++        let env_u64 = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
++        let wait = env_u64("GSA_RETRY_SECS", 300);
++        let max = env_u64("GSA_RETRY_MAX", 8);
++        let mut attempt = 1;
++        loop {
++            match self.login_email_pass_once(username, hashed_password).await {
++                Err(e) if attempt < max && format!("{}", e).contains("<html>") => {
++                    warn!("GSA login attempt {}/{} hit Apple's 503 throttle, restarting the whole login in {}s", attempt, max, wait);
++                    tokio::time::sleep(Duration::from_secs(wait)).await;
++                    attempt += 1;
++                }
++                other => return other,
++            }
++        }
++    }
++
++    async fn login_email_pass_once(
++        &mut self,
++        username: &str,
++        hashed_password: &[u8],
+     ) -> Result<LoginState, Error> {
+         let srp_client = SrpClient::<Sha256>::new(&G_2048);
+         let a: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+         let a_pub = srp_client.compute_public_ephemeral(&a);
+ 
+-        let valid_anisette = self.get_anisette().await?;
+-
+-        let mut gsa_headers = HeaderMap::new();
+-        gsa_headers.insert(
+-            "Content-Type",
+-            HeaderValue::from_str("text/x-xml-plist").unwrap(),
+-        );
+-        gsa_headers.insert("Accept", HeaderValue::from_str("*/*").unwrap());
+-        gsa_headers.extend(valid_anisette.get_gsservice_headers().into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), HeaderValue::from_str(&b).unwrap())));
+-
+-        let request_id = Uuid::new_v4().to_string().to_uppercase();
++        // Retries live in login_email_pass, which rebuilds everything: anisette OTPs in the
++        // headers and cpd go stale, and resending a stale request earned -22405/-22421 on Oct 17.
++        let (valid_anisette, gsa_headers, request_id, header, res) = loop {
++            let valid_anisette = self.get_anisette().await?;
+ 
+-        let header = RequestHeader {
+-            version: "1.0.1".to_string(),
+-        };
+-        let body = InitRequestBody {
+-            a_pub: plist::Value::Data(a_pub),
+-            cpd: valid_anisette.get_cpd_data(&request_id),
+-            operation: "init".to_string(),
+-            ps: vec!["s2k".to_string(), "s2k_fo".to_string()],
+-            username: username.to_string(),
+-        };
++            let mut gsa_headers = HeaderMap::new();
++            gsa_headers.insert(
++                "Content-Type",
++                HeaderValue::from_str("text/x-xml-plist").unwrap(),
++            );
++            gsa_headers.insert("Accept", HeaderValue::from_str("*/*").unwrap());
++            gsa_headers.extend(valid_anisette.get_gsservice_headers().into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), HeaderValue::from_str(&b).unwrap())));
+ 
+-        let packet = InitRequest {
+-            header: header.clone(),
+-            request: body,
+-        };
++            let request_id = Uuid::new_v4().to_string().to_uppercase();
+ 
+-        let mut buffer = Vec::new();
+-        plist::to_writer_xml(&mut buffer, &packet)?;
+-        let buffer = String::from_utf8(buffer).unwrap();
++            let header = RequestHeader {
++                version: "1.0.1".to_string(),
++            };
++            let body = InitRequestBody {
++                a_pub: plist::Value::Data(a_pub.clone()),
++                cpd: valid_anisette.get_cpd_data(&request_id),
++                operation: "init".to_string(),
++                ps: vec!["s2k".to_string(), "s2k_fo".to_string()],
++                username: username.to_string(),
++            };
+ 
+-        // println!("{:?}", gsa_headers.clone());
+-        // println!("{:?}", buffer);
++            let packet = InitRequest {
++                header: header.clone(),
++                request: body,
++            };
+ 
+-        let res = self
+-            .client
+-            .post(GSA_ENDPOINT)
+-            .headers(gsa_headers.clone())
+-            .body(buffer)
+-            .send().await;
++            let mut buffer = Vec::new();
++            plist::to_writer_xml(&mut buffer, &packet)?;
++            let buffer = String::from_utf8(buffer).unwrap();
+ 
+-        let res = parse_response(res).await?;
++            match self.gsa_post(&gsa_headers, &buffer).await {
++                Ok(res) => break (valid_anisette, gsa_headers, request_id, header, res),
++                Err(e) => return Err(e),
++            }
++        };
+         let err_check = Self::check_error(&res);
+         if err_check.is_err() {
+             return Err(err_check.err().unwrap());
+@@ -784,14 +858,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
+         plist::to_writer_xml(&mut buffer, &packet)?;
+         let buffer = String::from_utf8(buffer).unwrap();
+ 
+-        let res = self
+-            .client
+-            .post(GSA_ENDPOINT)
+-            .headers(gsa_headers.clone())
+-            .body(buffer)
+-            .send().await;
+-
+-        let res = parse_response(res).await?;
++        let res = self.gsa_post(&gsa_headers, &buffer).await?;
+         let err_check = Self::check_error(&res);
+         if err_check.is_err() {
+             return Err(err_check.err().unwrap());
+@@ -889,6 +956,11 @@ impl<T: AnisetteProvider> AppleAccount<T> {
+     }
+ 
+     pub async fn send_sms_2fa_to_devices(&self, phone_id: u32) -> Result<LoginState, crate::Error> {
++        self.send_phone_2fa(phone_id, "sms".to_string()).await
++    }
++
++    // mode is the trusted number's push_mode: "sms" or "voice" (landlines only get calls)
++    pub async fn send_phone_2fa(&self, phone_id: u32, mode: String) -> Result<LoginState, crate::Error> {
+         let headers = self.build_2fa_headers(true);
+ 
+ 
+@@ -896,7 +968,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
+             phone_number: PhoneNumber {
+                 id: phone_id
+             },
+-            mode: "sms".to_string(),
++            mode,
+             security_code: None
+         };
+ 
+@@ -940,7 +1012,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
+                 phone_number: PhoneNumber {
+                     id: new_state.trusted_phone_numbers.first().unwrap().id
+                 },
+-                mode: "sms".to_string(),
++                mode: new_state.trusted_phone_numbers.first().unwrap().push_mode.clone(),
+                 security_code: None
+             }));
+         }
